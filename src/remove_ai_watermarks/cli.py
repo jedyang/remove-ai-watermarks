@@ -677,7 +677,7 @@ def cmd_batch(
                     seed=seed,
                     hf_token=hf_token,
                     humanize=humanize,
-                    )
+                )
                 processed += 1
 
             except Exception as e:
