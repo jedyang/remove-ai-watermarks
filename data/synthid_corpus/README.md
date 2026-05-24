@@ -104,3 +104,36 @@ Generation can be driven through the browser (the account must be logged in):
   ingesting -- if the new image has not finished rendering, the script grabs the
   prior one (the corpus dedups by sha256, but the notes would mislabel it).
   ChatGPT also shows an A/B "which is better?" picker; click Skip first.
+
+**Originals, not previews.** Some platforms render a low-res preview in the chat
+(Grok serves a ~20KB 1024px JPEG/PNG; the in-page `<img>` fetch grabs *that*, not
+the original). Previews are re-encoded and **strip metadata**, so a "clean"
+preview is not proof the original is clean. Always pull the original via the
+platform's native Download / lightbox button and sanity-check the file size (a
+20KB "1024x1024" is a preview). ChatGPT's in-chat `<img>` *is* the full-res
+oaiusercontent original, so fetch+blob is fine there; Grok needs the lightbox
+Download; Leonardo serves the original JPEG in-chat (download button matches).
+
+## Per-platform watermark map (observed, May 2026)
+
+What each platform actually embeds, verified by byte-scan (and Gemini-app oracle
+where noted). The detector's coverage is complementary: metadata catches C2PA /
+IPTC; the visible detector catches the Gemini-family sparkle; the SynthID pixel
+itself has no local detector (oracle only).
+
+| Platform | C2PA issuer | SynthID pixel | IPTC "Made with AI" | Visible sparkle | Corpus label |
+|---|---|---|---|---|---|
+| Gemini app | Google | yes | - | yes | pos |
+| ChatGPT / gpt-image | OpenAI | yes | - | - | pos |
+| Microsoft Designer | OpenAI + Microsoft | yes (via OpenAI) | - | - | pos |
+| Google AI Studio (Nano Banana) | **none** | yes (oracle-confirmed) | - | yes | pos (metadata blind spot) |
+| Meta AI | none | no | **yes** | - | neg (for SynthID) |
+| Leonardo.ai | none | no | no | - | neg |
+| Grok (xAI) | none (non-adopter) | no | no | - | neg (captured: clean low-res preview) |
+| Bing Image Creator (DALL-E) | (expect OpenAI, like Designer) | - | - | - | not captured (UI uncooperative) |
+
+Key takeaways:
+- The same model differs by *surface*: Gemini app wraps C2PA, AI Studio (API/playground) emits none -- only the pixel + sparkle survive.
+- Microsoft Designer's DALL-E backend inherits OpenAI's C2PA+SynthID (issuer "OpenAI, Microsoft").
+- Meta uses the IPTC `digitalSourceType` marker, not C2PA or SynthID.
+- Bing and Grok web UIs are uncooperative for autonomous capture (no document_idle for screenshots; blob downloads intermittently no-op; low-res in-chat previews). Use their native download button manually if a full-res sample is needed.
