@@ -180,6 +180,13 @@ remove-ai-watermarks batch ./images/ --mode all
 #### Individual commands
 
 ```bash
+# Identify provenance: where an image was made + its watermark inventory.
+# Aggregates C2PA, IPTC "Made with AI", embedded SD/ComfyUI params, the
+# SynthID proxy, and the visible Gemini sparkle into one verdict. Reports
+# "unknown" (never "clean") when no signal is found, since stripped metadata
+# is not proof of a clean origin. Add --json for machine-readable output.
+remove-ai-watermarks identify image.png
+
 # Visible watermark only (Gemini / Nano Banana sparkle) — fast, offline
 remove-ai-watermarks visible image.png -o clean.png
 

@@ -5,6 +5,7 @@ You are a **principal Python engineer** maintaining a CLI tool and library for r
 ## How to run
 
 - `uv run remove-ai-watermarks all <image.png> -o <output.png>`
+- `uv run remove-ai-watermarks identify <image>` — provenance verdict (platform + watermark inventory + confidence); `--json` for machine output, `--no-visible` to skip the cv2 sparkle detector
 - `uv run remove-ai-watermarks metadata <image.png> --check` — inspect AI metadata (C2PA, EXIF, PNG chunks)
 - `uv run remove-ai-watermarks metadata <image.png> --remove -o <out.png>` — strip all AI metadata
 
@@ -25,7 +26,9 @@ You are a **principal Python engineer** maintaining a CLI tool and library for r
 
 - `noai/c2pa.py` — PNG chunk parser; use `extract_c2pa_chunk(path)` to get raw caBX payload, `has_c2pa_metadata(path)` to detect. Do not reimplement chunk parsing. `extract_c2pa_info(path)` sets `synthid_watermark`/`synthid_vendors` when the manifest is signed by a SynthID-using vendor.
 - `noai/constants.py` — PNG_SIGNATURE, C2PA_CHUNK_TYPE, C2PA_SIGNATURES, C2PA_ISSUERS, and `SYNTHID_C2PA_ISSUERS` (issuers that pair SynthID with C2PA: Google, OpenAI). Add a new issuer here, not inline.
-- `metadata.py` — `synthid_source(path)` returns the vendor name(s) if the C2PA manifest implies a SynthID pixel watermark, else None. Format-agnostic: PNG via the caBX parser, JPEG/WebP/AVIF/HEIF/JXL via a binary scan (C2PA marker + SynthID issuer + AI-source marker). `get_ai_metadata` surfaces the verdict, and `metadata --check` prints it as a callout.
+- `metadata.py` — `synthid_source(path)` returns the vendor name(s) if the C2PA manifest implies a SynthID pixel watermark, else None. Format-agnostic: PNG via the caBX parser, JPEG/WebP/AVIF/HEIF/JXL via a binary scan (C2PA marker + SynthID issuer + AI-source marker). `get_ai_metadata` surfaces the verdict, and `metadata --check` prints it as a callout. Both `get_ai_metadata` and `has_ai_metadata` guard the PIL open with `except Exception` (HEIC/unknown formats raise non-OSError) and fall through to the binary scan.
+- `identify.py` — `identify(path)` aggregates every locally-readable signal (C2PA issuer→platform, IPTC "Made with AI", embedded SD/ComfyUI params, SynthID proxy, visible Gemini sparkle) into one `ProvenanceReport`. `is_ai_generated` is True or None (never asserted False — stripped metadata is not proof of clean origin). Visible-sparkle is promoted only at confidence ≥ `_SPARKLE_THRESHOLD` (0.5; corpus-tuned to separate Gemini sparkles ≥0.56 from non-sparkle ≤0.49). The cv2 dependency lives in `gemini_engine.detect_sparkle_confidence`, not here. Add platform mappings to `_ISSUER_PLATFORM`, not inline. For non-PNG containers (JPEG/WebP/AVIF/HEIF/JXL) the caBX parser returns nothing, so issuer (`_issuers_in`) and generator (`_ai_tools_in`, reusing `C2PA_AI_TOOLS`) are recovered by binary-scanning the first MB; EXIF/XMP *fields* inside ISOBMFF are still not parsed (no positive fixtures to validate against).
+- `gemini_engine.py` — visible Gemini-sparkle remover/detector (cv2/numpy, no GPU). `detect_sparkle_confidence(path)` is the file-level entry point used by `identify.py`.
 - `face_protector.py` — YOLO detect + soft-blend pattern; mirror this for any "protect region during diffusion" features
 
 ## Known limitations

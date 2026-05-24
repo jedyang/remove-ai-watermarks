@@ -8,6 +8,7 @@ Provides commands for:
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from pathlib import Path
@@ -327,6 +328,55 @@ def cmd_metadata(
     # Remove
     out = remove_ai_metadata(source, output, keep_standard=keep_standard)
     console.print(f"  [green]✓[/] AI metadata stripped → {out}")
+
+
+# ── Provenance identification ───────────────────────────────────────
+
+
+@main.command("identify")
+@click.argument("source", type=click.Path(exists=True, path_type=Path))
+@click.option("--no-visible", is_flag=True, help="Skip the visible-sparkle detector (metadata-only, no cv2).")
+@click.option("--json", "as_json", is_flag=True, help="Emit the report as JSON instead of a table.")
+@click.pass_context
+def cmd_identify(ctx: click.Context, source: Path, no_visible: bool, as_json: bool) -> None:
+    """Identify where an image was made and what watermarks it carries.
+
+    Aggregates C2PA Content Credentials, IPTC "Made with AI" tags, embedded
+    generation parameters, the SynthID metadata proxy, and the visible Gemini
+    sparkle into a single provenance verdict. Absence of signals is reported as
+    "unknown", never as "clean" (stripped metadata leaves no local proof).
+    """
+    from dataclasses import asdict
+
+    from remove_ai_watermarks.identify import identify
+
+    source = _validate_image(source)
+    report = identify(source, check_visible=not no_visible)
+
+    if as_json:
+        click.echo(json.dumps(asdict(report), default=str, indent=2))
+        return
+
+    _banner()
+    verdict = {True: "[yellow]AI-generated[/]", False: "[green]not AI[/]", None: "[dim]unknown[/]"}[
+        report.is_ai_generated
+    ]
+    console.print(f"\n  Verdict: {verdict}  [dim](confidence: {report.confidence})[/]")
+    console.print(f"  Platform: {report.platform or '[dim]undetermined[/]'}")
+
+    if report.watermarks:
+        table = Table(show_header=True, header_style="bold", title="Watermarks / provenance markers")
+        table.add_column("Marker", style="cyan")
+        for wm in report.watermarks:
+            table.add_row(wm)
+        console.print(table)
+    else:
+        console.print("  [dim]No watermarks or provenance markers found.[/]")
+
+    if report.caveats:
+        console.print("\n  [dim]Caveats:[/]")
+        for c in report.caveats:
+            console.print(f"  [dim]- {c}[/]")
 
 
 # ── Combined "all" mode ──────────────────────────────────────────────

@@ -546,3 +546,17 @@ class GeminiEngine:
             result[py1:py2, px1:px2] = blended.astype(np.uint8)
 
         return result
+
+
+def detect_sparkle_confidence(image_path: Path) -> float | None:
+    """Visible-sparkle detection confidence for a file, for provenance use.
+
+    Loads the image with cv2 and runs :meth:`GeminiEngine.detect_watermark`.
+    Returns the NCC confidence in [0, 1], or None if the image cannot be read
+    (cv2 returns None for unsupported containers such as HEIC). Kept here so the
+    cv2 dependency stays in this module; callers apply their own threshold.
+    """
+    img = cv2.imread(str(image_path))
+    if img is None:
+        return None
+    return float(GeminiEngine().detect_watermark(img).confidence)
