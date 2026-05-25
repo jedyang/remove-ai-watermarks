@@ -294,3 +294,31 @@ class TestISOBMFF:
         cleaned, stripped = strip_c2pa_boxes(FTYP + b"\x00\x00\x00\x04XXXX")
         assert stripped == 0
         assert cleaned.startswith(FTYP)
+
+    def test_size_zero_box_runs_to_eof(self):
+        # size32==0 means the box extends to EOF; a non-C2PA box round-trips.
+        box = struct.pack(">I", 0) + b"free" + b"\x00\x00\x00\x00"
+        cleaned, stripped = strip_c2pa_boxes(FTYP + box)
+        assert stripped == 0
+        assert cleaned == FTYP + box
+
+    def test_truncated_largesize_terminates_safely(self):
+        # size32==1 promises a 64-bit largesize, but the box ends after 8 bytes;
+        # iteration must stop rather than read the missing largesize past EOF.
+        cleaned, stripped = strip_c2pa_boxes(FTYP + b"\x00\x00\x00\x01uuid")
+        assert stripped == 0
+        assert cleaned == FTYP
+
+
+class TestC2PAInvalidSignature:
+    """A .png file that is not actually PNG-signed must read as clean, not crash."""
+
+    def test_has_c2pa_false_for_non_png_bytes(self, tmp_path: Path):
+        fake = tmp_path / "fake.png"
+        fake.write_bytes(b"\xff\xd8\xff\xe0 not a png at all, just garbage bytes")
+        assert has_c2pa_metadata(fake) is False
+
+    def test_extract_chunk_none_for_non_png_bytes(self, tmp_path: Path):
+        fake = tmp_path / "fake.png"
+        fake.write_bytes(b"\xff\xd8\xff\xe0 not a png at all, just garbage bytes")
+        assert extract_c2pa_chunk(fake) is None

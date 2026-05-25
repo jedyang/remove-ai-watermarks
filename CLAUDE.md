@@ -20,7 +20,7 @@ You are a **principal Python engineer** maintaining a CLI tool and library for r
 ## Configuration
 
 - GPU/ML modules (invisible_engine, ctrlregen, watermark_remover) are optional — guard imports with `is_available()` checks
-- Tests for ML modules are limited to availability checks (require multi-GB downloads)
+- Tests for the *model-running* paths are limited to availability checks (multi-GB downloads). But the **pure helpers inside ML-adjacent modules are unit-tested without any download** and must stay that way: `_target_size` (native-vs-downscale, `test_invisible_engine.py`), the MPS->CPU fallback control flow via mocked pipelines (`test_img2img_runner.py`, 100% cover), and the tiling math `tile_positions`/`make_blend_weight`/`resize_center_crop` (`test_tiling.py`; `pytest.importorskip("torch")` since `tiling.py` imports torch at module top). Don't skip these as "ML, needs a model" — only `run_tiled`/`remove_watermark`/the diffusion bodies do.
 
 ## Key modules
 
