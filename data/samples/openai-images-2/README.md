@@ -26,7 +26,7 @@ The `trainedAlgorithmicMedia` tag is what triggers "Made with AI" labels on Inst
 
 ### Invisible pixel-level watermark
 
-OpenAI's system card for Images 2.0 states the model embeds an "imperceptible, robust, and content-specific" pixel-level watermark alongside C2PA. No public detector exists, so bypass cannot be verified empirically for this sample.
+OpenAI's system card for Images 2.0 states the model embeds an "imperceptible, robust, and content-specific" pixel-level watermark alongside C2PA. This sample was downloaded 2026-04-22, before OpenAI's 19 May 2026 rollout of Google's SynthID watermark across ChatGPT / Codex / the API, so it likely predates SynthID and carries only the original content-specific watermark. Since that rollout, the openai.com/verify tool (in preview) is the public oracle for both signals; there is still no local decoder, so bypass cannot be verified empirically here without the oracle.
 
 ## Reproducing the removal
 
