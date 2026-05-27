@@ -27,7 +27,9 @@ def runner():
 @pytest.fixture
 def sample_png(tmp_path: Path) -> Path:
     """Create a sample PNG for CLI testing."""
-    img = np.random.randint(0, 255, (200, 200, 3), dtype=np.uint8)
+    # Seeded: an unseeded random corner can occasionally trip the Doubao
+    # visible-mark detector, making `visible --mark auto` flaky.
+    img = np.random.default_rng(0).integers(0, 255, (200, 200, 3), dtype=np.uint8)
     path = tmp_path / "input.png"
     cv2.imwrite(str(path), img)
     return path
@@ -37,8 +39,9 @@ def _make_batch_dir(tmp_path: Path, count: int = 3) -> Path:
     """Create a directory with test images for batch testing."""
     input_dir = tmp_path / "input"
     input_dir.mkdir()
+    rng = np.random.default_rng(0)
     for i in range(count):
-        img = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
+        img = rng.integers(0, 255, (100, 100, 3), dtype=np.uint8)
         cv2.imwrite(str(input_dir / f"img_{i}.png"), img)
     return input_dir
 
@@ -119,7 +122,8 @@ class TestVisibleCommand:
     def test_visible_help(self, runner):
         result = runner.invoke(main, ["visible", "--help"])
         assert result.exit_code == 0
-        assert "Gemini watermark" in result.output
+        assert "visible AI watermark" in result.output
+        assert "--mark" in result.output
 
     def test_visible_basic(self, runner, sample_png, tmp_path):
         output = tmp_path / "clean.png"

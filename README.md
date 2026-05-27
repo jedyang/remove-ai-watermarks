@@ -14,7 +14,8 @@ If this tool saves you time, consider [sponsoring its development](https://githu
 
 ## Features
 
-- **Visible watermark removal** — Gemini / Nano Banana sparkle logo via reverse alpha blending (fast, offline, deterministic)
+- **Visible watermark removal** — Gemini / Nano Banana sparkle logo (reverse alpha blending) and the Doubao "豆包AI生成" text strip (locate + mask + inpaint); fast, offline, deterministic, no GPU. `visible --mark auto` picks the right one
+- **Universal region eraser (`erase`)** — remove any logo / watermark / object inside boxes you specify, regardless of position or colour. Default cv2 inpainting (CPU, instant); optional big-LaMa via onnxruntime (`lama` extra) for higher quality
 - **Invisible watermark removal** — SynthID, StableSignature, TreeRing via diffusion-based regeneration (needs a local GPU, or run it with no setup on [raiw.cc](https://raiw.cc))
 - **AI metadata stripping** — EXIF, PNG text chunks, C2PA provenance manifests (PNG / JPEG / AVIF / HEIF / JPEG-XL, and **MP4 / MOV / M4V video** at the container level), XMP DigitalSourceType
 - **"Made with AI" label removal** — removes the metadata that triggers AI labels on Instagram, Facebook, X (Twitter)
@@ -45,11 +46,11 @@ If this tool saves you time, consider [sponsoring its development](https://githu
 | **xAI Grok (Aurora)** | — | — | ✅ EXIF signature scheme (no C2PA): `Signature:` blob + UUID `Artist` | Detected (`identify`); metadata strip |
 | **Midjourney** | — | — | ✅ EXIF + XMP (prompt, model, seed) | Metadata strip |
 | **Meta AI** | — | — | ✅ IPTC "Made with AI" (digitalSourceType) | Metadata strip (removes the label) |
-| **Doubao** (ByteDance) / China AIGC generators | — | — | ✅ TC260 `<TC260:AIGC>` XMP label (China's mandatory AI labeling) | Metadata strip |
+| **Doubao** (ByteDance) / China AIGC generators | ✅ "豆包AI生成" text strip (bottom-right) | — | ✅ TC260 `<TC260:AIGC>` XMP label (China's mandatory AI labeling) | Locate + mask + inpaint (cv2, CPU) + metadata strip |
 | **StableSignature** (Meta) | — | ✅ In-model watermark | — | Diffusion regeneration |
 | **TreeRing** | — | ✅ Latent space watermark | — | Diffusion regeneration |
 
-> Visible watermarks (logo overlays) are currently used only by Google Gemini / Nano Banana. Other services rely on invisible watermarks and/or metadata. Our diffusion-based regeneration works against any invisible watermark in pixel or frequency domain.
+> Visible overlays are used by Google Gemini / Nano Banana (sparkle logo) and by Doubao / China AIGC generators (the mandated "...AI生成" corner text). Both are removed deterministically on CPU. Other services rely on invisible watermarks and/or metadata; our diffusion-based regeneration works against any invisible watermark in pixel or frequency domain. For a visible mark from any other source (any position, any colour), use the universal `erase --region` command.
 
 > **Detection:** `remove-ai-watermarks identify <image>` reports the origin platform and watermark inventory for all the signals above — C2PA issuer, the C2PA soft-binding forensic-watermark vendor (TrustMark / Digimarc / Imatag / ...), IPTC "Made with AI" plus the IPTC 2025.1 `AISystemUsed` field, the China TC260 AIGC label, embedded generation params, EXIF/XMP generator tags, the xAI/Grok EXIF signature, the SynthID metadata proxy, the visible sparkle, and (with the `[detect]` / `[trustmark]` extras) the open SD/SDXL/FLUX and Adobe TrustMark invisible watermarks. SynthID and the proprietary soft-binding watermarks (Digimarc etc.) have no local decoder, so they are reported by metadata proxy / vendor name only.
 
@@ -72,6 +73,16 @@ original = (watermarked − α × logo) / (1 − α)
 A three-stage NCC (Normalized Cross-Correlation) detector finds the watermark position and scale dynamically, so it works even if the image was resized or cropped. After removal, residual sparkle-edge artifacts are cleaned via gradient-masked inpainting.
 
 **Speed**: ~0.05s per image. No GPU needed.
+
+### Removing the Doubao "豆包AI生成" text watermark
+
+Doubao (ByteDance) stamps every output with a light, semi-transparent "豆包AI生成" text strip in the bottom-right corner — the visible AIGC label mandated by China's TC260 standard. Unlike the fixed-size Gemini sparkle, it is a text strip that scales with image width, so we anchor a generous bottom-right box by geometry, extract the light low-saturation glyph pixels with a polarity-aware white top-hat mask, and inpaint them (cv2 Telea/NS). The mask is background-relative, so it leaves white-paper documents untouched instead of smearing their text. On dense-text backgrounds where the mask would explode, removal is skipped rather than guessed.
+
+**Speed**: ~0.03s per image. No GPU needed. Best on photo / illustration backgrounds; on high-contrast edges a faint residue can remain (use `erase --backend lama` for neural-quality fill).
+
+### Universal region eraser
+
+For any visible mark the dedicated engines do not cover — a logo anywhere, any colour — `erase --region x,y,w,h` inpaints the box you specify. The default `cv2` backend is instant and dependency-free; the optional `lama` backend (big-LaMa via onnxruntime, `lama` extra, ~200 MB model downloaded on first use) gives much cleaner fills on textured regions at the cost of ~3-4 GB RAM per call.
 
 ### Removing SynthID and other invisible watermarks
 
@@ -221,8 +232,14 @@ remove-ai-watermarks batch ./images/ --mode all
 # of a clean origin. Add --json for machine-readable output.
 remove-ai-watermarks identify image.png
 
-# Visible watermark only (Gemini / Nano Banana sparkle) — fast, offline
+# Visible watermark only — fast, offline, CPU. --mark auto (default) picks
+# between the Gemini sparkle and the Doubao "豆包AI生成" text strip; force one
+# with --mark gemini / --mark doubao.
 remove-ai-watermarks visible image.png -o clean.png
+
+# Erase arbitrary region(s) — universal, any logo/watermark/object, any position.
+# Default cv2 inpainting (CPU). --backend lama uses big-LaMa (extra 'lama').
+remove-ai-watermarks erase image.png --region 1640,1930,400,100 -o clean.png
 
 # Invisible watermark only (SynthID etc.) — requires GPU
 remove-ai-watermarks invisible image.png -o clean.png --humanize 4.0

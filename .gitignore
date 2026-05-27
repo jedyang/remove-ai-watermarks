@@ -34,3 +34,10 @@ yolov8n.pt
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# Doubao watermark calibration (local only; ship only the derived alpha-map asset).
+# Synthetic seeds + raw Doubao captures are regenerable and not committed.
+# Non-ours reference artifacts go in any _refs/ dir (already ignored above): usable
+# locally for bootstrap/validation, never redistributed in the repo.
+data/doubao_capture/seeds/
+data/doubao_capture/captures/

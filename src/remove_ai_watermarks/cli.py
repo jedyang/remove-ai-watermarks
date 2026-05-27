@@ -12,7 +12,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import click
 from rich.console import Console
@@ -25,7 +25,7 @@ from remove_ai_watermarks import __version__
 if TYPE_CHECKING:
     import numpy as np
 
-    from remove_ai_watermarks.gemini_engine import DetectionResult
+    from remove_ai_watermarks.gemini_engine import DetectionResult, GeminiEngine
 
 console = Console()
 
@@ -130,6 +130,72 @@ def _write_bgr_with_alpha(
     cv2.imwrite(str(path), bgra)
 
 
+def _run_doubao_if_selected(
+    ctx: click.Context,
+    image: np.ndarray,
+    alpha: np.ndarray | None,
+    output: Path,
+    mark: str,
+    gemini_engine: GeminiEngine,
+    detect: bool,
+    detect_threshold: float,
+    inpaint_method: str,
+    strip_metadata: bool,
+) -> bool:
+    """Run the Doubao text-strip removal path when it is the selected mark.
+
+    Returns True when this path handled the image (caller should stop). In
+    ``auto`` mode the Doubao detector competes with the Gemini detector and wins
+    only when it is both positive and at least as confident.
+    """
+    from remove_ai_watermarks.doubao_engine import DoubaoEngine
+
+    doubao = DoubaoEngine()
+    d_det = doubao.detect(image)
+
+    if mark == "auto":
+        g_det = gemini_engine.detect_watermark(image)
+        use_doubao = d_det.detected and d_det.confidence >= g_det.confidence
+        console.print(
+            f"  [dim]Mark auto:[/] gemini={g_det.confidence:.2f} doubao={d_det.confidence:.2f} "
+            f"-> {'doubao' if use_doubao else 'gemini'}"
+        )
+    else:
+        use_doubao = mark == "doubao"
+
+    if not use_doubao:
+        return False
+
+    if detect and not d_det.detected and d_det.confidence < detect_threshold:
+        console.print(
+            f"  [yellow]⚠[/] Doubao mark not detected  [dim](coverage {d_det.coverage:.1%}). "
+            f"Use --no-detect to force.[/]"
+        )
+        raise SystemExit(0)
+
+    method: Literal["telea", "ns"] = "ns" if inpaint_method == "ns" else "telea"
+    t0 = time.monotonic()
+    with console.status("[cyan]Removing Doubao watermark…[/]"):
+        result = doubao.remove_watermark(image, inpaint_method=method)
+    elapsed = time.monotonic() - t0
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    _write_bgr_with_alpha(output, result, alpha, clear_region=d_det.region)
+
+    if strip_metadata:
+        try:
+            from remove_ai_watermarks.metadata import remove_ai_metadata
+
+            remove_ai_metadata(output, output)
+        except Exception as e:
+            if ctx.obj.get("verbose"):
+                console.print(f"  [yellow]⚠[/] Failed to strip metadata: {e}")
+
+    size_kb = output.stat().st_size / 1024
+    console.print(f"  [green]✓[/] Doubao mark removed → {output}  [dim]({size_kb:.0f} KB, {elapsed:.2f}s)[/]")
+    return True
+
+
 # ── Main group ───────────────────────────────────────────────────────
 
 
@@ -167,6 +233,12 @@ def main(ctx: click.Context, verbose: bool) -> None:
 @click.option("--inpaint-strength", type=float, default=0.85, help="Inpainting blend strength (0.0-1.0).")
 @click.option("--detect/--no-detect", default=True, help="Detect watermark before removal.")
 @click.option("--detect-threshold", type=float, default=0.25, help="Detection confidence threshold.")
+@click.option(
+    "--mark",
+    type=click.Choice(["auto", "gemini", "doubao"]),
+    default="auto",
+    help="Which visible mark to target. auto picks the stronger of the two detectors.",
+)
 @click.option("--strip-metadata/--keep-metadata", default=True, help="Strip AI metadata from output.")
 @click.pass_context
 def cmd_visible(
@@ -178,11 +250,14 @@ def cmd_visible(
     inpaint_strength: float,
     detect: bool,
     detect_threshold: float,
+    mark: str,
     strip_metadata: bool,
 ) -> None:
-    """Remove visible Gemini watermark (sparkle logo) from an image.
+    """Remove a visible AI watermark from an image.
 
-    Uses reverse alpha blending — fast, deterministic, offline.
+    Targets the Gemini sparkle logo (reverse alpha blending) or the Doubao
+    "豆包AI生成" text strip (locate -> mask -> inpaint). Fast, deterministic,
+    offline. ``--mark auto`` picks whichever detector fires stronger.
     """
     from remove_ai_watermarks.gemini_engine import GeminiEngine
 
@@ -202,6 +277,12 @@ def cmd_visible(
 
     h, w = image.shape[:2]
     console.print(f"  [dim]Input:[/]  {source.name}  ({w}x{h})")
+
+    # Resolve which visible mark to target, then run the Doubao path if chosen.
+    if _run_doubao_if_selected(
+        ctx, image, alpha, output, mark, engine, detect, detect_threshold, inpaint_method, strip_metadata
+    ):
+        return
 
     # Detection (we always detect softly, to find dynamic region for inpainting)
     with console.status("[cyan]Detecting watermark…[/]"):
@@ -254,6 +335,98 @@ def cmd_visible(
 
     size_kb = output.stat().st_size / 1024
     console.print(f"  [green]✓[/] Saved: {output}  [dim]({size_kb:.0f} KB, {elapsed:.2f}s)[/]")
+
+
+# ── Universal region eraser ─────────────────────────────────────────
+
+
+def _parse_region(spec: str) -> tuple[int, int, int, int]:
+    """Parse an ``x,y,w,h`` region string into a 4-int tuple."""
+    parts = spec.replace(" ", "").split(",")
+    if len(parts) != 4:
+        raise click.BadParameter(f"region must be 'x,y,w,h', got: {spec!r}")
+    try:
+        x, y, w, h = (int(p) for p in parts)
+    except ValueError as e:
+        raise click.BadParameter(f"region values must be integers: {spec!r}") from e
+    if w <= 0 or h <= 0:
+        raise click.BadParameter(f"region width/height must be positive: {spec!r}")
+    return x, y, w, h
+
+
+@main.command("erase")
+@click.argument("source", type=click.Path(exists=True, path_type=Path))
+@click.option("--region", "regions", multiple=True, required=True, help="x,y,w,h box to erase (repeatable).")
+@click.option(
+    "-o", "--output", type=click.Path(path_type=Path), default=None, help="Output path (default: <source>_clean.<ext>)."
+)
+@click.option(
+    "--backend",
+    type=click.Choice(["cv2", "lama"]),
+    default="cv2",
+    help="Inpaint backend. cv2: instant, no deps. lama: onnxruntime big-LaMa, better quality (extra 'lama').",
+)
+@click.option("--inpaint-method", type=click.Choice(["telea", "ns"]), default="telea", help="cv2 inpaint method.")
+@click.option("--dilate", type=int, default=3, help="Grow the box by this many px before inpainting.")
+@click.option("--strip-metadata/--keep-metadata", default=True, help="Strip AI metadata from output.")
+@click.pass_context
+def cmd_erase(
+    ctx: click.Context,
+    source: Path,
+    regions: tuple[str, ...],
+    output: Path | None,
+    backend: str,
+    inpaint_method: str,
+    dilate: int,
+    strip_metadata: bool,
+) -> None:
+    """Erase arbitrary region(s) from an image via inpainting.
+
+    Universal and position-agnostic: removes any logo / watermark / object inside
+    the boxes you pass, regardless of colour or location. Runs on CPU. Use this
+    for marks the dedicated ``visible`` engines (Gemini, Doubao) do not cover.
+    """
+    from remove_ai_watermarks.region_eraser import erase
+
+    _banner()
+    source = _validate_image(source)
+    if output is None:
+        output = source.with_stem(source.stem + "_clean")
+
+    boxes = [_parse_region(r) for r in regions]
+
+    image, alpha = _read_bgr_and_alpha(source)
+    if image is None:
+        console.print(f"[red]Error:[/] Failed to read image: {source}")
+        raise SystemExit(1)
+    h, w = image.shape[:2]
+    console.print(f"  [dim]Input:[/]  {source.name}  ({w}x{h})  [dim]{len(boxes)} region(s), backend={backend}[/]")
+
+    t0 = time.monotonic()
+    method: Literal["telea", "ns"] = "ns" if inpaint_method == "ns" else "telea"
+    try:
+        with console.status(f"[cyan]Erasing ({backend})…[/]"):
+            result = erase(image, boxes=boxes, backend=backend, dilate=dilate, cv2_method=method)
+    except RuntimeError as e:
+        console.print(f"  [red]Error:[/] {e}")
+        raise SystemExit(1) from e
+    elapsed = time.monotonic() - t0
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    clear = boxes[0] if len(boxes) == 1 else None
+    _write_bgr_with_alpha(output, result, alpha, clear_region=clear)
+
+    if strip_metadata:
+        try:
+            from remove_ai_watermarks.metadata import remove_ai_metadata
+
+            remove_ai_metadata(output, output)
+        except Exception as e:
+            if ctx.obj.get("verbose"):
+                console.print(f"  [yellow]⚠[/] Failed to strip metadata: {e}")
+
+    size_kb = output.stat().st_size / 1024
+    console.print(f"  [green]✓[/] Erased {len(boxes)} region(s) → {output}  [dim]({size_kb:.0f} KB, {elapsed:.2f}s)[/]")
 
 
 # ── Invisible watermark removal ─────────────────────────────────────
