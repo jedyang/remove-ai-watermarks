@@ -626,6 +626,14 @@ def cmd_identify(ctx: click.Context, source: Path, no_visible: bool, as_json: bo
     console.print(f"\n  Verdict: {verdict}  [dim](confidence: {report.confidence})[/]")
     console.print(f"  Platform: {report.platform or '[dim]undetermined[/]'}")
 
+    if report.is_ai_generated is None:
+        console.print(
+            "  [dim]No locally-readable AI signal found. This is not the same as 'clean': "
+            "metadata is often stripped by re-encoding, screenshots, or upload, and SynthID-class "
+            "pixel watermarks (Gemini / Nano Banana / gpt-image) have no local detector. "
+            "See caveats below.[/]"
+        )
+
     if report.integrity_clashes:
         console.print("\n  [bold red]⚠ Integrity clash[/] [dim](provenance signals contradict each other)[/]")
         for clash in report.integrity_clashes:

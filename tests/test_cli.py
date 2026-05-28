@@ -375,6 +375,14 @@ class TestIdentifyCommand:
         assert result.exit_code == 0
         assert "unknown" in result.output
 
+    def test_identify_unknown_explains_why(self, runner, tmp_clean_png):
+        # An unknown verdict must explain itself inline (issue #22: users read a bare
+        # "unknown" as the tool being broken) rather than only in the caveats section.
+        result = runner.invoke(main, ["identify", str(tmp_clean_png), "--no-visible"])
+        assert result.exit_code == 0
+        assert "No locally-readable AI signal found" in result.output
+        assert "not the same as 'clean'" in result.output
+
     def test_identify_ai_png_reports_platform(self, runner, tmp_png_with_ai_metadata):
         result = runner.invoke(main, ["identify", str(tmp_png_with_ai_metadata), "--no-visible"])
         assert result.exit_code == 0
