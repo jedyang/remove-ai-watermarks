@@ -19,7 +19,17 @@ dependencies = [
 gpu = [
     "torch>=2.0.0",
     "diffusers>=0.38.0",
-    "transformers>=4.35.0",
+    # diffusers 0.38's auto-pipeline registry imports ``Qwen3VLForConditional
+    # Generation`` (its ``nucleusmoe_image`` pipeline), which only exists in
+    # transformers 5.x -- so ``from diffusers import AutoPipelineForImage2Image``
+    # fails on transformers 4.x. The real SDXL-loading break was NOT transformers
+    # 5.x but the tokenizers *release candidate* (0.23.0rc0) that the global
+    # ``prerelease = "allow"`` drags in: its CLIP tokenizer raises
+    # ``RobertaProcessing.__new__() got an unexpected keyword argument 'cls'``.
+    # Cap tokenizers to the stable 0.22 line (transformers 5.x accepts
+    # >=0.22,<=0.23.0) so the rc is excluded while SDXL still loads.
+    "transformers>=5,<6",
+    "tokenizers>=0.22,<0.23",
     "accelerate>=0.25.0",
     "controlnet-aux>=0.0.9",
     "safetensors",
