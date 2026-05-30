@@ -61,6 +61,24 @@ def is_watermark_removal_available() -> bool:
     return _HAS_TORCH and _HAS_DIFFUSERS
 
 
+# Drop-in fp16-safe replacement for the SDXL VAE. The stock SDXL VAE overflows
+# to NaN in fp16 and decodes to an all-black image (issue #29: the raiw.cc black
+# result on a CUDA fp16 backend). This community VAE is numerically rescaled to
+# stay in fp16 range. SDXL-architecture only.
+_SDXL_FP16_VAE_ID = "madebyollin/sdxl-vae-fp16-fix"
+
+
+def _needs_fp16_vae_fix(model_id: str, default_model_id: str, is_fp16: bool) -> bool:
+    """Whether the plain img2img pipeline must swap in the fp16-fixed SDXL VAE.
+
+    Gated to the default SDXL checkpoint running in fp16: cpu/mps run fp32 (the
+    stock VAE is fine there) and the differential pipeline upcasts the VAE on its
+    own, so only this path on a fp16 GPU (CUDA/XPU) hits the NaN/black decode.
+    A custom non-SDXL ``model_id`` keeps its own VAE (the fix is SDXL-specific).
+    """
+    return is_fp16 and model_id == default_model_id
+
+
 _CUDA_FIX_ENV_KEY = "NOAI_CUDA_FIXED"
 
 
@@ -369,6 +387,14 @@ class WatermarkRemover:
             }
             if self.hf_token:
                 load_kwargs["token"] = self.hf_token
+
+            # Avoid the SDXL fp16 NaN/all-black decode (issue #29) by loading the
+            # fp16-fixed VAE for the default SDXL checkpoint on a fp16 GPU.
+            if _needs_fp16_vae_fix(self.model_id, self.DEFAULT_MODEL_ID, self.torch_dtype == torch.float16):
+                from diffusers import AutoencoderKL
+
+                self._set_progress("Loading fp16-fixed SDXL VAE (avoids black output)...")
+                load_kwargs["vae"] = AutoencoderKL.from_pretrained(_SDXL_FP16_VAE_ID, torch_dtype=torch.float16)
 
             self._pipeline = AutoImg2ImgPipeline.from_pretrained(  # type: ignore
                 self.model_id,

@@ -204,3 +204,28 @@ class TestPlatformPaths:
         # If we get here without error, asset loading works
         assert engine._alpha_small.shape == (48, 48)
         assert engine._alpha_large.shape == (96, 96)
+
+
+class TestFp16VaeFix:
+    """The plain SDXL img2img pipeline must swap in the fp16-fixed VAE on fp16
+    GPUs to avoid the NaN/all-black decode (issue #29). Pure decision logic, no
+    torch or model download needed."""
+
+    DEFAULT = "stabilityai/stable-diffusion-xl-base-1.0"
+
+    def test_default_sdxl_on_fp16_needs_fix(self):
+        from remove_ai_watermarks.noai.watermark_remover import _needs_fp16_vae_fix
+
+        assert _needs_fp16_vae_fix(self.DEFAULT, self.DEFAULT, is_fp16=True) is True
+
+    def test_fp32_does_not_need_fix(self):
+        """cpu/mps run fp32, where the stock SDXL VAE is fine."""
+        from remove_ai_watermarks.noai.watermark_remover import _needs_fp16_vae_fix
+
+        assert _needs_fp16_vae_fix(self.DEFAULT, self.DEFAULT, is_fp16=False) is False
+
+    def test_non_default_model_keeps_own_vae(self):
+        """A custom (non-SDXL) checkpoint must not get the SDXL-specific VAE."""
+        from remove_ai_watermarks.noai.watermark_remover import _needs_fp16_vae_fix
+
+        assert _needs_fp16_vae_fix("runwayml/stable-diffusion-v1-5", self.DEFAULT, is_fp16=True) is False
