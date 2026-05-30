@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import re
+import struct
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -169,15 +170,58 @@ def _is_ai_key(key: str) -> bool:
     return any(kw in key_lower for kw in AI_KEYWORDS)
 
 
+# PNG ancillary chunks that can carry provenance metadata (XMP, EXIF, text).
+# Never IDAT -- that is the compressed pixel stream.
+_PNG_META_CHUNKS: frozenset[bytes] = frozenset({b"tEXt", b"iTXt", b"zTXt", b"eXIf", b"iCCP"})
+
+
+def _png_late_metadata(image_path: Path, window: int) -> bytes:
+    """Payloads of PNG metadata chunks that start *beyond* the first ``window``
+    bytes, found by seeking past the (large) ``IDAT`` pixel stream.
+
+    A PNG encoder may append the XMP/EXIF packet after the image data, so a
+    fixed first-``size`` read misses it (e.g. a TC260 AIGC label in an XMP
+    ``iTXt`` chunk at ~2.7 MB). This is the PNG analogue of the ISOBMFF
+    late-box scan in :func:`scan_head`. Returns only chunks past ``window`` so
+    bytes already in the head are not duplicated; empty when there are none.
+    """
+    out = bytearray()
+    try:
+        with open(image_path, "rb") as f:
+            if f.read(8) != b"\x89PNG\r\n\x1a\n":
+                return b""
+            pos = 8
+            while True:
+                f.seek(pos)
+                header = f.read(8)
+                if len(header) < 8:
+                    break
+                (length,) = struct.unpack(">I", header[:4])
+                chunk_type = header[4:8]
+                if chunk_type == b"IEND":
+                    break
+                data_start = pos + 8
+                if chunk_type in _PNG_META_CHUNKS and data_start >= window:
+                    f.seek(data_start)
+                    out += f.read(length)
+                pos = data_start + length + 4  # data + CRC
+    except OSError as exc:
+        logger.debug("PNG late-metadata scan failed on %s: %s", image_path, exc)
+        return b""
+    return bytes(out)
+
+
 def scan_head(image_path: Path, size: int = 1024 * 1024) -> bytes:
-    """First ``size`` bytes of the file, plus -- for ISOBMFF containers -- the
-    payloads of any provenance (``uuid`` / ``jumb``) boxes found beyond that
-    window by seeking past large boxes like ``mdat``.
+    """First ``size`` bytes of the file, plus the payloads of any provenance
+    metadata found beyond that window: ISOBMFF ``uuid`` / ``jumb`` boxes (seeking
+    past large boxes like ``mdat``) and PNG ``tEXt`` / ``iTXt`` / ``eXIf`` chunks
+    (seeking past ``IDAT``).
 
     This is the shared input for every C2PA / AIGC / IPTC byte scan. The
-    ISOBMFF extension catches a manifest placed AFTER the media data in a
-    streaming / non-faststart MP4, which a fixed first-MB read would miss. For
-    non-ISOBMFF inputs it is exactly ``f.read(size)`` -- behavior-neutral.
+    extensions catch a manifest or XMP packet placed AFTER the media data -- a
+    non-faststart MP4 manifest, or a PNG XMP packet appended after the pixels --
+    which a fixed first-MB read would miss. For other inputs, and for files that
+    fit within ``size``, it is exactly ``f.read(size)`` -- behavior-neutral.
     """
     with open(image_path, "rb") as f:
         head = f.read(size)
@@ -188,6 +232,10 @@ def scan_head(image_path: Path, size: int = 1024 * 1024) -> bytes:
         region = isobmff.scan_c2pa_region(image_path)
         if region:
             head += region
+    elif head[:8] == b"\x89PNG\r\n\x1a\n" and len(head) == size:
+        # len(head) == size means the file is at least `size` bytes, so metadata
+        # chunks may lie beyond the window; otherwise the whole PNG is in `head`.
+        head += _png_late_metadata(image_path, size)
     return head
 
 
@@ -252,17 +300,21 @@ def has_ai_metadata(image_path: Path) -> bool:
 def aigc_label(image_path: Path) -> dict[str, str] | None:
     """Parse a China TC260 AI-labeling block, if present.
 
-    Two serializations are recognized:
+    Three serializations are recognized:
 
     - a PNG ``tEXt``/``iTXt`` chunk keyed ``AIGC`` carrying the raw JSON object
-      (as written by Doubao / ByteDance), read via PIL; and
+      (as written by Doubao / ByteDance), read via PIL;
     - an XMP ``<TC260:AIGC>{...}</TC260:AIGC>`` block (HTML-entity encoded text),
-      found by a container-agnostic raw-byte scan (PNG/JPEG/WebP alike).
+      found by a container-agnostic raw-byte scan (PNG/JPEG/WebP alike); and
+    - a raw-JSON ``{"AIGC":{...}}`` block with no namespace, as embedded in JPEG
+      EXIF (UserComment) by some China-served generators, brace-matched from the
+      scan head.
 
     Returns the decoded JSON (e.g. ``{"Label": "1", "ContentProducer": ...}``)
-    or None. The PNG-chunk key ``AIGC`` is generic, so a JSON object there is
-    accepted only if it carries at least one known TC260 field (``_TC260_FIELDS``);
-    the namespaced XMP element is unambiguous, so any JSON object is accepted.
+    or None. The generic forms (the PNG-chunk key ``AIGC`` and the bare
+    ``{"AIGC":...}`` object) are accepted only if they carry at least one known
+    TC260 field (``_TC260_FIELDS``); the namespaced XMP element is unambiguous,
+    so any JSON object is accepted.
     """
     import html
     import json
@@ -293,12 +345,35 @@ def aigc_label(image_path: Path) -> dict[str, str] | None:
     if isinstance(value, str) and (result := _parse(value, require_tc260_field=True)):
         return result
 
-    # XMP <TC260:AIGC>{...}</TC260:AIGC> block (namespaced element, unambiguous).
+    # XMP TC260:AIGC, namespaced (unambiguous) in either serialization RDF allows:
+    # an element  <TC260:AIGC>{...}</TC260:AIGC>  or an attribute  TC260:AIGC="{...}"
+    # (the attribute form is what PicWish writes). Both are HTML-entity encoded.
     data = scan_head(image_path)
-    match = re.search(rb"<TC260:AIGC>(.*?)</TC260:AIGC>", data, re.DOTALL)
-    if not match:
-        return None
-    return _parse(html.unescape(match.group(1).decode("utf-8", "replace")), require_tc260_field=False)
+    match = re.search(
+        rb'<TC260:AIGC>(.*?)</TC260:AIGC>|TC260:AIGC\s*=\s*"(.*?)"',
+        data,
+        re.DOTALL,
+    )
+    if match:
+        body = match.group(1) if match.group(1) is not None else match.group(2)
+        return _parse(html.unescape(body.decode("utf-8", "replace")), require_tc260_field=False)
+
+    # Raw-JSON {"AIGC":{...}} block (no namespace), as written into JPEG EXIF
+    # (UserComment) by some China-served generators -- the PNG-chunk and XMP
+    # paths above both miss it. The bytes pre-check keeps the common (no-AIGC)
+    # path off the full-buffer decode; raw_decode then brace-matches the inner
+    # object (respecting nested braces / quoted strings) and `_parse` applies the
+    # same dict coercion + TC260-field gate as the generic PNG-chunk path.
+    if b'"AIGC"' in data:
+        text = data.decode("latin-1")
+        brace = text.find("{", text.find('"AIGC"') + len('"AIGC"'))
+        if brace != -1:
+            try:
+                _, end = json.JSONDecoder().raw_decode(text, brace)
+            except ValueError:
+                return None
+            return _parse(text[brace:end], require_tc260_field=True)
+    return None
 
 
 def huggingface_job(image_path: Path) -> str | None:

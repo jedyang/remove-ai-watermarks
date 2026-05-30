@@ -705,6 +705,82 @@ class TestAIGCLabel:
         assert aigc_label(out) is None
         assert not has_ai_metadata(out)
 
+    def _aigc_exif_jpeg(self, tmp_path: Path, producer: str = "001191440300708461136T1308L") -> Path:
+        """Some China-served generators embed the raw-JSON ``{"AIGC":{...}}``
+        block in JPEG EXIF (UserComment) -- no PNG chunk, no namespaced XMP."""
+        import json
+
+        import piexif
+
+        p = tmp_path / "aigc_exif.jpg"
+        Image.new("RGB", (32, 32)).save(p)
+        payload = json.dumps({"AIGC": {"Label": "1", "ContentProducer": producer, "ProduceID": "abc123"}})
+        exif = {"Exif": {piexif.ExifIFD.UserComment: payload.encode("ascii")}}
+        piexif.insert(piexif.dump(exif), str(p))
+        return p
+
+    def test_parses_raw_json_exif_form(self, tmp_path: Path):
+        from remove_ai_watermarks.metadata import aigc_label
+
+        info = aigc_label(self._aigc_exif_jpeg(tmp_path))
+        assert info is not None
+        assert info["Label"] == "1"
+        assert info["ContentProducer"] == "001191440300708461136T1308L"
+
+    def test_has_ai_metadata_detects_raw_json_exif_form(self, tmp_path: Path):
+        assert has_ai_metadata(self._aigc_exif_jpeg(tmp_path))
+
+    def test_raw_json_without_tc260_field_ignored(self, tmp_path: Path):
+        """A bare ``{"AIGC":{...}}`` object with no TC260 field must not fire."""
+        import json
+
+        import piexif
+
+        from remove_ai_watermarks.metadata import aigc_label
+
+        p = tmp_path / "unrelated.jpg"
+        Image.new("RGB", (32, 32)).save(p)
+        payload = json.dumps({"AIGC": {"unrelated": "value"}})
+        exif = {"Exif": {piexif.ExifIFD.UserComment: payload.encode("ascii")}}
+        piexif.insert(piexif.dump(exif), str(p))
+        assert aigc_label(p) is None
+
+    def _aigc_attr_png(self, tmp_path: Path, producer: str = "picwish") -> Path:
+        """PicWish writes the TC260 label as an XMP *attribute*
+        (``TC260:AIGC="{...}"``), not the nested element form."""
+        p = tmp_path / "picwish.png"
+        Image.new("RGB", (32, 32)).save(p)
+        xmp = (
+            '<rdf:Description rdf:about="" '
+            'xmlns:TC260="http://www.tc260.org.cn/ns/AIGC/1.0/" '
+            f'TC260:AIGC="{{&quot;Label&quot;:&quot;1&quot;,&quot;ContentProducer&quot;:&quot;{producer}&quot;}}"/>'
+        )
+        with open(p, "ab") as f:
+            f.write(xmp.encode())
+        return p
+
+    def test_parses_xmp_attribute_form(self, tmp_path: Path):
+        from remove_ai_watermarks.metadata import aigc_label
+
+        info = aigc_label(self._aigc_attr_png(tmp_path))
+        assert info is not None
+        assert info["ContentProducer"] == "picwish"
+
+    def test_scan_head_collects_png_metadata_past_window(self, tmp_path: Path):
+        """A PNG metadata chunk beyond the read window is still reachable -- the
+        regression for a TC260 XMP packet appended after a large IDAT."""
+        import json
+
+        from remove_ai_watermarks.metadata import _png_late_metadata, scan_head
+
+        p = tmp_path / "late.png"
+        pnginfo = PngInfo()
+        pnginfo.add_text("AIGC", json.dumps({"Label": "1", "ContentProducer": "doubao"}))
+        Image.new("RGB", (16, 16)).save(p, pnginfo=pnginfo)
+        # window = 8 (just the signature) makes the text chunk "late".
+        assert b"ContentProducer" in _png_late_metadata(p, 8)
+        assert b"ContentProducer" in scan_head(p, 8)
+
 
 class TestHuggingFaceJob:
     """HuggingFace-hosted job marker (``hf-job-id`` PNG text chunk)."""
