@@ -1,6 +1,6 @@
 [project]
 name = "remove-ai-watermarks"
-version = "0.8.0"
+version = "0.8.1"
 description = "Remove visible and invisible AI watermarks from images (Gemini / Nano Banana, ChatGPT, Stable Diffusion)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -117,6 +117,13 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/remove_ai_watermarks"]
+
+[tool.hatch.build.targets.sdist]
+# Keep the source distribution small: ship the package + metadata, not the
+# committed test corpora / calibration captures under data/ (tens of MB --
+# synthid_corpus images + the visible-mark captures), which pushed the 0.8.0
+# sdist past PyPI's per-project file-size limit (the wheel ships only src/).
+exclude = ["/data"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
