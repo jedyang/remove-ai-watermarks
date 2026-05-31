@@ -2874,7 +2874,6 @@ dependencies = [
     { name = "piexif" },
     { name = "pillow" },
     { name = "python-dotenv" },
-    { name = "rich" },
 ]
 
 [package.optional-dependencies]
@@ -2948,7 +2947,6 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.1.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "remove-ai-watermarks", extras = ["gpu", "detect", "trustmark", "lama", "dev"], marker = "extra == 'all'" },
-    { name = "rich", specifier = ">=13.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4.0" },
     { name = "safetensors", marker = "extra == 'gpu'" },
     { name = "tokenizers", marker = "extra == 'gpu'", specifier = ">=0.22,<0.23" },

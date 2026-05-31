@@ -1,13 +1,14 @@
 """Unified CLI for remove-ai-watermarks.
 
 Provides commands for:
-  - Visible watermark removal (Gemini sparkle) — works offline, fast
-  - Invisible watermark removal (SynthID etc.) — requires GPU/diffusion models
-  - AI metadata stripping — lightweight, no ML deps needed
+  - Visible watermark removal (Gemini sparkle) - works offline, fast
+  - Invisible watermark removal (SynthID etc.) - requires GPU/diffusion models
+  - AI metadata stripping - lightweight, no ML deps needed
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import time
@@ -15,20 +16,92 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 import click
-from rich.console import Console
-from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
-from rich.table import Table
 
 from remove_ai_watermarks import __version__, watermark_registry
-from remove_ai_watermarks.noai.watermark_profiles import DEFAULT_STRENGTH
+from remove_ai_watermarks.noai.watermark_profiles import resolve_strength
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
+
     from numpy.typing import NDArray
 
     from remove_ai_watermarks.gemini_engine import DetectionResult
 
-console = Console()
+# --- plain-text output layer (replaces rich: no colors, no markup, no boxes) ---
+
+
+class _Table:
+    """Plain-text stand-in for rich.Table."""
+
+    def __init__(self, *args: Any, title: str | None = None, **kwargs: Any) -> None:
+        self._title = title
+        self._headers: list[str] = []
+        self._rows: list[list[str]] = []
+
+    def add_column(self, header: str = "", *args: Any, **kwargs: Any) -> None:
+        self._headers.append(str(header))
+
+    def add_row(self, *cells: Any) -> None:
+        self._rows.append([str(c) for c in cells])
+
+    def render(self) -> str:
+        lines: list[str] = []
+        if self._title:
+            lines.append(self._title)
+        if any(self._headers):
+            lines.append("  ".join(self._headers))
+        lines.extend("  ".join(row) for row in self._rows)
+        return "\n".join(f"  {line}" for line in lines)
+
+
+class _Progress:
+    """No-op stand-in for rich.Progress; results are printed directly instead."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def __enter__(self) -> _Progress:
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+    def add_task(self, *args: Any, **kwargs: Any) -> int:
+        return 0
+
+    def advance(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+
+class _Console:
+    """Minimal plain-text replacement for rich.Console."""
+
+    def print(self, *objects: Any, **kwargs: Any) -> None:
+        click.echo(" ".join(o.render() if isinstance(o, _Table) else str(o) for o in objects))
+
+    @contextlib.contextmanager
+    def status(self, message: str = "", **kwargs: Any) -> Generator[None, None, None]:
+        if message:
+            click.echo(message)
+        yield
+
+
+def _panel(text: str = "", *args: Any, **kwargs: Any) -> str:
+    return text
+
+
+def _column(*args: Any, **kwargs: Any) -> None:
+    return None
+
+
+Panel = _panel
+Table = _Table
+Progress = _Progress
+SpinnerColumn = BarColumn = TextColumn = TimeElapsedColumn = _column
+console = _Console()
 
 SUPPORTED_FORMATS = {".png", ".jpg", ".jpeg", ".webp"}
 
@@ -45,7 +118,7 @@ def _setup_logging(verbose: bool) -> None:
 def _banner() -> None:
     console.print(
         Panel(
-            f"[bold cyan]Remove-AI-Watermarks[/] [dim]v{__version__}[/]\n[dim]Visible & invisible watermark removal[/]",
+            f"Remove-AI-Watermarks v{__version__}\nVisible & invisible watermark removal",
             border_style="cyan",
             padding=(0, 2),
         )
@@ -54,12 +127,10 @@ def _banner() -> None:
 
 def _validate_image(path: Path) -> Path:
     if not path.exists():
-        console.print(f"[red]Error:[/] File not found: {path}")
+        console.print(f"Error: File not found: {path}")
         raise SystemExit(1)
     if path.suffix.lower() not in SUPPORTED_FORMATS:
-        console.print(
-            f"[yellow]Warning:[/] {path.suffix} may not be supported (expected: {', '.join(SUPPORTED_FORMATS)})"
-        )
+        console.print(f"Warning: {path.suffix} may not be supported (expected: {', '.join(SUPPORTED_FORMATS)})")
     return path
 
 
@@ -124,7 +195,7 @@ def _write_bgr_with_alpha(
     image_io.imwrite(path, bgra)
 
 
-# ── Main group ───────────────────────────────────────────────────────
+# -- Main group -------------------------------------------------------
 
 
 @click.group(invoke_without_command=True)
@@ -146,7 +217,7 @@ def main(ctx: click.Context, verbose: bool) -> None:
         click.echo(ctx.get_help())
 
 
-# ── Visible (Gemini) watermark removal ───────────────────────────────
+# -- Visible (Gemini) watermark removal -------------------------------
 
 
 @main.command("visible")
@@ -198,11 +269,11 @@ def cmd_visible(
     # Load image (preserving any alpha channel separately)
     image, alpha = _read_bgr_and_alpha(source)
     if image is None:
-        console.print(f"[red]Error:[/] Failed to read image: {source}")
+        console.print(f"Error: Failed to read image: {source}")
         raise SystemExit(1)
 
     h, w = image.shape[:2]
-    console.print(f"  [dim]Input:[/]  {source.name}  ({w}x{h})")
+    console.print(f"  Input:  {source.name}  ({w}x{h})")
 
     # Resolve the target mark from the known-watermark registry. ``auto`` scans
     # every in-auto mark in its usual place and picks the strongest; an explicit
@@ -210,31 +281,28 @@ def cmd_visible(
     if mark == "auto":
         best = registry.best_auto_mark(image)
         if best is None:
-            console.print("  [yellow]⚠[/] No known visible mark detected (gemini / doubao).")
+            console.print("  Warning: No known visible mark detected (gemini / doubao).")
             if detect:
-                console.print("  [dim]Skipping. Use --mark <name> --no-detect to force.[/]")
+                console.print("  Skipping. Use --mark <name> --no-detect to force.")
                 raise SystemExit(0)
             target = "gemini"  # forced (no-detect): fall back to the default mark
         else:
             target = best.key
-            console.print(f"  [dim]Mark auto:[/] {best.label}  [dim]({best.location}, conf {best.confidence:.2f})[/]")
+            console.print(f"  Mark auto: {best.label}  ({best.location}, conf {best.confidence:.2f})")
     else:
         target = mark
 
     chosen = registry.get_mark(target)
     det = chosen.detect(image)
     if detect and not det.detected:
-        console.print(
-            f"  [yellow]⚠[/] {chosen.label} not detected  "
-            f"[dim](conf {det.confidence:.2f}). Use --no-detect to force.[/]"
-        )
+        console.print(f"  Warning: {chosen.label} not detected  (conf {det.confidence:.2f}). Use --no-detect to force.")
         raise SystemExit(0)
     if det.detected:
-        console.print(f"  [green]✓[/] {chosen.label} detected  [dim]({chosen.location}, conf {det.confidence:.2f})[/]")
+        console.print(f"  {chosen.label} detected  ({chosen.location}, conf {det.confidence:.2f})")
 
     method: Literal["telea", "ns"] = "ns" if inpaint_method == "ns" else "telea"
     t0 = time.monotonic()
-    with console.status(f"[cyan]Removing {chosen.label}… ({chosen.recovery})[/]"):
+    with console.status(f"Removing {chosen.label}... ({chosen.recovery})"):
         result, _ = chosen.remove(
             image,
             inpaint_method=method,
@@ -256,13 +324,13 @@ def cmd_visible(
             remove_ai_metadata(output, output)
         except Exception as e:
             if ctx.obj.get("verbose"):
-                console.print(f"  [yellow]⚠[/] Failed to strip metadata: {e}")
+                console.print(f"  Warning: Failed to strip metadata: {e}")
 
     size_kb = output.stat().st_size / 1024
-    console.print(f"  [green]✓[/] Saved: {output}  [dim]({size_kb:.0f} KB, {elapsed:.2f}s)[/]")
+    console.print(f"  Saved: {output}  ({size_kb:.0f} KB, {elapsed:.2f}s)")
 
 
-# ── Universal region eraser ─────────────────────────────────────────
+# -- Universal region eraser -----------------------------------------
 
 
 def _parse_region(spec: str) -> tuple[int, int, int, int]:
@@ -322,18 +390,18 @@ def cmd_erase(
 
     image, alpha = _read_bgr_and_alpha(source)
     if image is None:
-        console.print(f"[red]Error:[/] Failed to read image: {source}")
+        console.print(f"Error: Failed to read image: {source}")
         raise SystemExit(1)
     h, w = image.shape[:2]
-    console.print(f"  [dim]Input:[/]  {source.name}  ({w}x{h})  [dim]{len(boxes)} region(s), backend={backend}[/]")
+    console.print(f"  Input:  {source.name}  ({w}x{h})  {len(boxes)} region(s), backend={backend}")
 
     t0 = time.monotonic()
     method: Literal["telea", "ns"] = "ns" if inpaint_method == "ns" else "telea"
     try:
-        with console.status(f"[cyan]Erasing ({backend})…[/]"):
+        with console.status(f"Erasing ({backend})..."):
             result = erase(image, boxes=boxes, backend=backend, dilate=dilate, cv2_method=method)
     except RuntimeError as e:
-        console.print(f"  [red]Error:[/] {e}")
+        console.print(f"  Error: {e}")
         raise SystemExit(1) from e
     elapsed = time.monotonic() - t0
 
@@ -347,13 +415,13 @@ def cmd_erase(
             remove_ai_metadata(output, output)
         except Exception as e:
             if ctx.obj.get("verbose"):
-                console.print(f"  [yellow]⚠[/] Failed to strip metadata: {e}")
+                console.print(f"  Warning: Failed to strip metadata: {e}")
 
     size_kb = output.stat().st_size / 1024
-    console.print(f"  [green]✓[/] Erased {len(boxes)} region(s) → {output}  [dim]({size_kb:.0f} KB, {elapsed:.2f}s)[/]")
+    console.print(f"  Erased {len(boxes)} region(s) -> {output}  ({size_kb:.0f} KB, {elapsed:.2f}s)")
 
 
-# ── Invisible watermark removal ─────────────────────────────────────
+# -- Invisible watermark removal -------------------------------------
 
 
 @main.command("invisible")
@@ -361,7 +429,12 @@ def cmd_erase(
 @click.option(
     "-o", "--output", type=click.Path(path_type=Path), default=None, help="Output path (default: <source>_clean.<ext>)."
 )
-@click.option("--strength", type=float, default=DEFAULT_STRENGTH, help="Denoising strength (0.0-1.0). Default: 0.10.")
+@click.option(
+    "--strength",
+    type=float,
+    default=None,
+    help="Denoising strength (0.0-1.0). Default: 0.10 (SDXL), 1.0 clean-noise for ctrlregen.",
+)
 @click.option("--steps", type=int, default=50, help="Number of denoising steps. Default: 50.")
 @click.option(
     "--pipeline",
@@ -397,7 +470,7 @@ def cmd_invisible(
     ctx: click.Context,
     source: Path,
     output: Path | None,
-    strength: float,
+    strength: float | None,
     steps: int,
     pipeline: str,
     device: str,
@@ -416,8 +489,7 @@ def cmd_invisible(
 
     if not invisible_available():
         console.print(
-            "[red]Error:[/] GPU dependencies not installed.\n"
-            "  Install them with: [bold]pip install 'remove-ai-watermarks\\[gpu]'[/]"
+            "Error: GPU dependencies not installed.\n  Install them with: pip install 'remove-ai-watermarks[gpu]'"
         )
         raise SystemExit(1)
 
@@ -430,7 +502,7 @@ def cmd_invisible(
     device_str = None if device == "auto" else device
 
     def progress_cb(msg: str) -> None:
-        console.print(f"  [dim]{msg}[/]")
+        console.print(f"  {msg}")
 
     engine = InvisibleEngine(
         device=device_str,
@@ -439,9 +511,9 @@ def cmd_invisible(
         progress_callback=progress_cb,
     )
 
-    console.print(f"  [dim]Input:[/]    {source.name}")
-    console.print(f"  [dim]Pipeline:[/] {pipeline}")
-    console.print(f"  [dim]Strength:[/] {strength}  Steps: {steps}")
+    console.print(f"  Input:    {source.name}")
+    console.print(f"  Pipeline: {pipeline}")
+    console.print(f"  Strength: {resolve_strength(strength, pipeline)}  Steps: {steps}")
 
     t0 = time.monotonic()
     result_path = engine.remove_watermark(
@@ -458,10 +530,10 @@ def cmd_invisible(
     elapsed = time.monotonic() - t0
 
     size_kb = result_path.stat().st_size / 1024
-    console.print(f"\n  [green]✓[/] Saved: {result_path}  [dim]({size_kb:.0f} KB, {elapsed:.1f}s)[/]")
+    console.print(f"\n  Saved: {result_path}  ({size_kb:.0f} KB, {elapsed:.1f}s)")
 
 
-# ── Metadata operations ─────────────────────────────────────────────
+# -- Metadata operations ---------------------------------------------
 
 
 @main.command("metadata")
@@ -499,10 +571,10 @@ def cmd_metadata(
     if check or (not remove):
         has_ai = has_ai_metadata(source)
         if has_ai:
-            console.print(f"  [yellow]⚠[/] AI metadata detected in {source.name}:")
+            console.print(f"  Warning: AI metadata detected in {source.name}:")
             meta = get_ai_metadata(source)
             if synthid := meta.get("synthid_watermark"):
-                console.print(f"  [bold yellow]⚠ SynthID watermark (inferred from C2PA metadata) {synthid}[/]")
+                console.print(f"  Warning: SynthID watermark (inferred from C2PA metadata) {synthid}")
             table = Table(show_header=True, header_style="bold")
             table.add_column("Key", style="cyan")
             table.add_column("Value")
@@ -510,17 +582,17 @@ def cmd_metadata(
                 table.add_row(k, str(v)[:80])
             console.print(table)
         else:
-            console.print(f"  [green]✓[/] No AI metadata found in {source.name}")
+            console.print(f"  No AI metadata found in {source.name}")
 
         if not remove:
             return
 
     # Remove
     out = remove_ai_metadata(source, output, keep_standard=keep_standard)
-    console.print(f"  [green]✓[/] AI metadata stripped → {out}")
+    console.print(f"  AI metadata stripped -> {out}")
 
 
-# ── Provenance identification ───────────────────────────────────────
+# -- Provenance identification ---------------------------------------
 
 
 @main.command("identify")
@@ -552,24 +624,22 @@ def cmd_identify(ctx: click.Context, source: Path, no_visible: bool, as_json: bo
         return
 
     _banner()
-    verdict = {True: "[yellow]AI-generated[/]", False: "[green]not AI[/]", None: "[dim]unknown[/]"}[
-        report.is_ai_generated
-    ]
-    console.print(f"\n  Verdict: {verdict}  [dim](confidence: {report.confidence})[/]")
-    console.print(f"  Platform: {report.platform or '[dim]undetermined[/]'}")
+    verdict = {True: "AI-generated", False: "not AI", None: "unknown"}[report.is_ai_generated]
+    console.print(f"\n  Verdict: {verdict}  (confidence: {report.confidence})")
+    console.print(f"  Platform: {report.platform or 'undetermined'}")
 
     if report.is_ai_generated is None:
         console.print(
-            "  [dim]No locally-readable AI signal found. This is not the same as 'clean': "
+            "  No locally-readable AI signal found. This is not the same as 'clean': "
             "metadata is often stripped by re-encoding, screenshots, or upload, and SynthID-class "
             "pixel watermarks (Gemini / Nano Banana / gpt-image) have no local detector. "
-            "See caveats below.[/]"
+            "See caveats below."
         )
 
     if report.integrity_clashes:
-        console.print("\n  [bold red]⚠ Integrity clash[/] [dim](provenance signals contradict each other)[/]")
+        console.print("\n  Warning: Integrity clash (provenance signals contradict each other)")
         for clash in report.integrity_clashes:
-            console.print(f"  [red]- {clash}[/]")
+            console.print(f"  - {clash}")
 
     if report.watermarks:
         table = Table(show_header=True, header_style="bold", title="Watermarks / provenance markers")
@@ -578,15 +648,15 @@ def cmd_identify(ctx: click.Context, source: Path, no_visible: bool, as_json: bo
             table.add_row(wm)
         console.print(table)
     else:
-        console.print("  [dim]No watermarks or provenance markers found.[/]")
+        console.print("  No watermarks or provenance markers found.")
 
     if report.caveats:
-        console.print("\n  [dim]Caveats:[/]")
+        console.print("\n  Caveats:")
         for c in report.caveats:
-            console.print(f"  [dim]- {c}[/]")
+            console.print(f"  - {c}")
 
 
-# ── Combined "all" mode ──────────────────────────────────────────────
+# -- Combined "all" mode ----------------------------------------------
 
 
 @main.command("all")
@@ -599,7 +669,10 @@ def cmd_identify(ctx: click.Context, source: Path, no_visible: bool, as_json: bo
     "--inpaint-method", type=click.Choice(["ns", "telea", "gaussian"]), default="ns", help="Inpainting method."
 )
 @click.option(
-    "--strength", type=float, default=DEFAULT_STRENGTH, help="Invisible watermark denoising strength. Default: 0.10."
+    "--strength",
+    type=float,
+    default=None,
+    help="Invisible watermark denoising strength. Default: 0.10 (SDXL), 1.0 clean-noise for ctrlregen.",
 )
 @click.option("--steps", type=int, default=50, help="Number of denoising steps for invisible removal.")
 @click.option(
@@ -639,7 +712,7 @@ def cmd_all(
     output: Path | None,
     inpaint: bool,
     inpaint_method: Literal["ns", "telea", "gaussian"],
-    strength: float,
+    strength: float | None,
     steps: int,
     pipeline: str,
     model: str | None,
@@ -680,40 +753,40 @@ def cmd_all(
 
         os.close(tmp_fd)
 
-        # ── Step 1: Visible watermark ────────────────────────────────
-        console.print("\n  [bold cyan]① Visible watermark removal[/]")
+        # -- Step 1: Visible watermark --------------------------------
+        console.print("\n  1) Visible watermark removal")
         engine = GeminiEngine()
         image, alpha = _read_bgr_and_alpha(source)
         if image is None:
-            console.print(f"[red]Error:[/] Failed to read image: {source}")
+            console.print(f"Error: Failed to read image: {source}")
             raise SystemExit(1)
 
         h, w = image.shape[:2]
-        console.print(f"    [dim]Input:[/] {source.name}  ({w}x{h})")
+        console.print(f"    Input: {source.name}  ({w}x{h})")
 
-        with console.status("[cyan]Removing visible watermark…[/]"):
+        with console.status("Removing visible watermark..."):
             det = engine.detect_watermark(image)
             if det.detected:
                 result = engine.remove_watermark(image)
                 if inpaint:
                     region = _watermark_region(det, w, h)
                     result = engine.inpaint_residual(result, region, method=inpaint_method)
-                console.print("    [green]✓[/] Visible watermark removed")
+                console.print("    Visible watermark removed")
             else:
                 result = image.copy()
-                console.print("    [dim]Skipped (no visible watermark detected)[/]")
+                console.print("    Skipped (no visible watermark detected)")
 
         # Save to temp file for invisible engine input (preserve alpha if present)
         _write_bgr_with_alpha(tmp_path, result, alpha)
 
-        # ── Step 2: Invisible watermark ──────────────────────────────
-        console.print("\n  [bold cyan]② Invisible watermark removal[/]")
+        # -- Step 2: Invisible watermark ------------------------------
+        console.print("\n  2) Invisible watermark removal")
         from remove_ai_watermarks.invisible_engine import is_available as invisible_available
 
         if not invisible_available():
             console.print(
-                "    [yellow]⚠[/] Skipped — GPU dependencies not installed.\n"
-                "    Install them with: [bold]pip install 'remove-ai-watermarks\\[gpu]'[/]"
+                "    Warning: Skipped - GPU dependencies not installed.\n"
+                "    Install them with: pip install 'remove-ai-watermarks[gpu]'"
             )
         else:
             from remove_ai_watermarks.invisible_engine import InvisibleEngine
@@ -721,7 +794,7 @@ def cmd_all(
             device_str = None if device == "auto" else device
 
             def progress_cb(msg: str) -> None:
-                console.print(f"    [dim]{msg}[/]")
+                console.print(f"    {msg}")
 
             inv_engine = InvisibleEngine(
                 model_id=model,
@@ -731,7 +804,7 @@ def cmd_all(
                 progress_callback=progress_cb,
             )
 
-            console.print(f"    [dim]Strength:[/] {strength}  Steps: {steps}")
+            console.print(f"    Strength: {resolve_strength(strength, pipeline)}  Steps: {steps}")
             inv_engine.remove_watermark(
                 image_path=tmp_path,
                 output_path=tmp_path,
@@ -742,26 +815,26 @@ def cmd_all(
                 protect_text=not no_protect_text,
                 max_resolution=max_resolution,
             )
-            console.print("    [green]✓[/] Invisible watermark removed")
+            console.print("    Invisible watermark removed")
 
-        # ── Step 3: Metadata ─────────────────────────────────────────
-        console.print("\n  [bold cyan]③ AI metadata stripping[/]")
+        # -- Step 3: Metadata -----------------------------------------
+        console.print("\n  3) AI metadata stripping")
         try:
             from remove_ai_watermarks.metadata import remove_ai_metadata
 
             remove_ai_metadata(tmp_path, tmp_path)
-            console.print("    [green]✓[/] AI metadata stripped")
+            console.print("    AI metadata stripped")
         except Exception as e:
-            console.print(f"    [yellow]⚠[/] Metadata strip failed: {e}")
+            console.print(f"    Warning: Metadata strip failed: {e}")
 
-        # ── Write final result ────────────────────────────────────────
+        # -- Write final result ----------------------------------------
         # The invisible step (and downstream cv2.IMREAD_COLOR paths) drops alpha,
         # so re-attach the original alpha plane unchanged when writing the final
         # output for transparent formats.
         output.parent.mkdir(parents=True, exist_ok=True)
         final_bgr, _ = _read_bgr_and_alpha(tmp_path)
         if final_bgr is None:
-            console.print(f"[red]Error:[/] Failed to read intermediate file: {tmp_path}")
+            console.print(f"Error: Failed to read intermediate file: {tmp_path}")
             raise SystemExit(1)
         _write_bgr_with_alpha(output, final_bgr, alpha)
 
@@ -770,13 +843,13 @@ def cmd_all(
         if tmp_path.exists():
             tmp_path.unlink()
 
-    # ── Done ─────────────────────────────────────────────────────
+    # -- Done -----------------------------------------------------
     elapsed = time.monotonic() - t0
     size_kb = output.stat().st_size / 1024
-    console.print(f"\n  [bold green]✓ Done:[/] {output}  [dim]({size_kb:.0f} KB, {elapsed:.1f}s total)[/]")
+    console.print(f"\n  Done: {output}  ({size_kb:.0f} KB, {elapsed:.1f}s total)")
 
 
-# ── Batch command ────────────────────────────────────────────────────
+# -- Batch command ----------------------------------------------------
 
 
 def _process_batch_image(
@@ -932,12 +1005,12 @@ def cmd_batch(
     images = sorted(p for p in directory.iterdir() if p.suffix.lower() in SUPPORTED_FORMATS)
 
     if not images:
-        console.print(f"[yellow]No supported images found in {directory}[/]")
+        console.print(f"No supported images found in {directory}")
         return
 
-    console.print(f"  Found [bold]{len(images)}[/] images in {directory}")
-    console.print(f"  Output → {output_dir}")
-    console.print(f"  Mode: [cyan]{mode}[/]")
+    console.print(f"  Found {len(images)} images in {directory}")
+    console.print(f"  Output -> {output_dir}")
+    console.print(f"  Mode: {mode}")
 
     processed = 0
     errors = 0
@@ -950,11 +1023,11 @@ def cmd_batch(
         TimeElapsedColumn(),
         console=console,
     ) as progress:
-        task = progress.add_task("Processing…", total=len(images))
+        task = progress.add_task("Processing...", total=len(images))
 
         for img_path in images:
             out_path = output_dir / img_path.name
-            progress.update(task, description=f"[cyan]{img_path.name}[/]")
+            progress.update(task, description=f"{img_path.name}")
 
             try:
                 _process_batch_image(
@@ -977,11 +1050,11 @@ def cmd_batch(
             except Exception as e:
                 errors += 1
                 if ctx.obj.get("verbose"):
-                    console.print(f"  [red]✗[/] {img_path.name}: {e}")
+                    console.print(f"  {img_path.name}: {e}")
 
             progress.advance(task)
 
-    console.print(f"\n  [green]✓[/] {processed} processed" + (f"  [red]✗[/] {errors} errors" if errors else ""))
+    console.print(f"\n  {processed} processed" + (f"  {errors} errors" if errors else ""))
 
 
 if __name__ == "__main__":

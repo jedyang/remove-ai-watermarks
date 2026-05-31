@@ -526,8 +526,8 @@ class TestBatchCommand:
 
 
 class TestGpuHintMarkup:
-    """The GPU-extra install hint must survive rich markup (the ``[gpu]`` token
-    is otherwise parsed as a style tag and silently dropped)."""
+    """The GPU-extra install hint must reach the user with the ``[gpu]`` token
+    intact (plain output prints it verbatim, with no markup parsing)."""
 
     def test_invisible_install_hint_keeps_gpu_extra(self, runner, sample_png):
         with patch("remove_ai_watermarks.invisible_engine.is_available", return_value=False):
