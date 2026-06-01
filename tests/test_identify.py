@@ -7,6 +7,8 @@ against the real committed C2PA / IPTC fixtures in data/samples/.
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import patch
@@ -367,6 +369,68 @@ class TestIdentifyVisibleSparkle:
     def test_metadata_keeps_high_even_with_sparkle(self, tmp_png_with_ai_metadata: Path):
         # Metadata verdict (high) is not downgraded by an additional sparkle hit.
         with patch(_SPARKLE_TARGET, return_value=0.7):
+            r = identify(tmp_png_with_ai_metadata, check_visible=True)
+        assert r.confidence == "high"
+
+
+class TestIdentifyImportIsLight:
+    """`import identify` must stay torch-free (lazy noai/__init__): the package
+    is deployed on a 512 MB host where eagerly pulling torch/diffusers OOMs."""
+
+    def test_import_identify_does_not_pull_torch(self):
+        # Only meaningful where torch is installed (the gpu/detect extra); on a
+        # core-only CI runner torch can't be in sys.modules anyway.
+        pytest.importorskip("torch")
+        code = "import sys, remove_ai_watermarks.identify; sys.exit(1 if 'torch' in sys.modules else 0)"
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, check=False)  # noqa: S603
+        assert result.returncode == 0, f"import identify pulled torch: {result.stderr.decode()[-500:]}"
+
+
+# Where the registry-backed Doubao/Jimeng visible detector resolves.
+_TEXT_MARKS_TARGET = "remove_ai_watermarks.identify._visible_text_marks"
+
+
+class TestIdentifyVisibleTextMarks:
+    """The visible Doubao/Jimeng marks are a stripped-metadata visual fallback,
+    parallel to the Gemini sparkle: each lifts an Unknown verdict to medium."""
+
+    @staticmethod
+    def _detection(key: str, label: str, conf: float):
+        from remove_ai_watermarks.watermark_registry import MarkDetection
+
+        return MarkDetection(key, label, "bottom-right", True, conf, (0, 0, 10, 10))
+
+    def test_doubao_promotes_to_medium(self, tmp_clean_png: Path):
+        det = self._detection("doubao", "Doubao 豆包AI生成 text", 0.8)
+        with patch(_SPARKLE_TARGET, return_value=None), patch(_TEXT_MARKS_TARGET, return_value=[det]):
+            r = identify(tmp_clean_png, check_visible=True)
+        assert r.is_ai_generated is True
+        assert r.confidence == "medium"
+        assert r.platform is not None
+        assert "Doubao" in r.platform
+        signal = next(s for s in r.signals if s.name == "visible_doubao")
+        assert signal.confidence == "medium"
+
+    def test_jimeng_promotes_to_medium(self, tmp_clean_png: Path):
+        det = self._detection("jimeng", "Jimeng 即梦AI wordmark", 0.9)
+        with patch(_SPARKLE_TARGET, return_value=None), patch(_TEXT_MARKS_TARGET, return_value=[det]):
+            r = identify(tmp_clean_png, check_visible=True)
+        assert r.is_ai_generated is True
+        assert r.confidence == "medium"
+        assert r.platform is not None
+        assert "Jimeng" in r.platform
+        assert any(s.name == "visible_jimeng" for s in r.signals)
+
+    def test_check_visible_false_skips_text_marks(self, tmp_clean_png: Path):
+        det = self._detection("doubao", "Doubao 豆包AI生成 text", 0.99)
+        with patch(_SPARKLE_TARGET, return_value=None), patch(_TEXT_MARKS_TARGET, return_value=[det]) as mock:
+            r = identify(tmp_clean_png, check_visible=False)
+        mock.assert_not_called()
+        assert not any(s.name == "visible_doubao" for s in r.signals)
+
+    def test_metadata_keeps_high_even_with_text_mark(self, tmp_png_with_ai_metadata: Path):
+        det = self._detection("doubao", "Doubao 豆包AI生成 text", 0.8)
+        with patch(_SPARKLE_TARGET, return_value=None), patch(_TEXT_MARKS_TARGET, return_value=[det]):
             r = identify(tmp_png_with_ai_metadata, check_visible=True)
         assert r.confidence == "high"
 

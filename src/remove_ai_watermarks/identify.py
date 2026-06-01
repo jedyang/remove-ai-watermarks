@@ -8,7 +8,8 @@ Aggregates every locally-readable signal into a single :class:`ProvenanceReport`
 - **PNG text / EXIF generation parameters** (Stable Diffusion, ComfyUI, InvokeAI).
 - **SynthID metadata proxy** -- a C2PA companion from a SynthID-using vendor
   (Google / OpenAI) implies the invisible pixel watermark.
-- **Visible Gemini sparkle** (optional; needs cv2/numpy, no GPU).
+- **Visible marks** (optional; needs cv2/numpy, no GPU): the Gemini sparkle and
+  the ByteDance Doubao 豆包AI生成 / Jimeng 即梦AI text marks.
 
 Hard limit: a stripped image (re-encoded, screenshotted, social-media upload)
 loses all metadata, and the SynthID *pixel* watermark is not locally decodable
@@ -42,6 +43,8 @@ from remove_ai_watermarks.noai.constants import C2PA_AI_TOOLS, C2PA_ISSUERS
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from remove_ai_watermarks.watermark_registry import MarkDetection
 
 log = logging.getLogger(__name__)
 
@@ -334,6 +337,46 @@ def _visible_sparkle(image_path: Path) -> float | None:
     return detect_sparkle_confidence(image_path)
 
 
+# Visible text marks (registry keys) -> human-readable platform, mirroring the
+# Gemini-sparkle phrasing. These are the stripped-metadata visual fallback for
+# the China-served ByteDance generators (normally also caught by the TC260 AIGC
+# metadata label); the per-engine detection thresholds live in the registry.
+_VISIBLE_MARK_PLATFORM = {
+    "doubao": "ByteDance Doubao (visible 豆包AI生成 mark detected)",
+    "jimeng": "ByteDance Jimeng / Dreamina (visible 即梦AI mark detected)",
+}
+
+
+def _visible_text_marks(image_path: Path) -> list[MarkDetection]:
+    """Detected visible Doubao/Jimeng marks (registry ``MarkDetection`` list).
+
+    The Gemini sparkle keeps its own ``_visible_sparkle`` path (file-level
+    confidence); these two text marks reuse the registry detectors, which apply
+    each engine's calibrated NCC threshold via ``MarkDetection.detected``.
+    Optional: needs cv2/numpy; returns ``[]`` if the engines/assets are missing
+    or the image can't be read.
+    """
+    try:
+        from remove_ai_watermarks.image_io import imread
+        from remove_ai_watermarks.watermark_registry import get_mark
+    except Exception as exc:  # cv2/engine assets missing
+        log.debug("visible-mark detectors unavailable: %s", exc)
+        return []
+    image = imread(image_path)
+    if image is None:
+        return []
+    detections: list[MarkDetection] = []
+    for key in _VISIBLE_MARK_PLATFORM:
+        try:
+            det = get_mark(key).detect(image)
+        except Exception as exc:  # one engine failing must not break identify
+            log.debug("visible-mark %s detector failed: %s", key, exc)
+            continue
+        if det.detected:
+            detections.append(det)
+    return detections
+
+
 def _invisible_watermark(image_path: Path) -> str | None:
     """Open invisible-watermark scheme name (SD/SDXL/FLUX) or None.
 
@@ -361,7 +404,8 @@ def identify(image_path: Path, *, check_visible: bool = True, check_invisible: b
 
     Args:
         image_path: Path to the image (PNG, JPEG, WebP, or ISOBMFF container).
-        check_visible: Also run the visible Gemini-sparkle detector (cv2). Set
+        check_visible: Also run the visible-mark detectors (cv2) -- the Gemini
+            sparkle and the Doubao/Jimeng text marks from the registry. Set
             False for a pure-metadata, dependency-light scan.
         check_invisible: Also decode open invisible watermarks (SD/SDXL/FLUX) via
             the optional imwatermark library. No-op when it is not installed.
@@ -580,7 +624,16 @@ def identify(image_path: Path, *, check_visible: bool = True, check_invisible: b
         if platform is None:
             platform = "Google Gemini family (visible sparkle detected)"
 
-    visible_only = any(s.name == "visible_sparkle" for s in signals) and not ai_from_metadata
+    # ── Visible Doubao / Jimeng text marks (registry; same stripped-metadata
+    #    fallback role as the Gemini sparkle above) ─
+    if check_visible:
+        for det in _visible_text_marks(image_path):
+            signals.append(Signal(f"visible_{det.key}", f"NCC confidence {det.confidence:.2f}", "medium"))
+            watermarks.append(f"Visible {det.label} (confidence {det.confidence:.2f})")
+            if platform is None:
+                platform = _VISIBLE_MARK_PLATFORM[det.key]
+
+    visible_only = any(s.name.startswith("visible_") for s in signals) and not ai_from_metadata
     hf_only = bool(hf_job) and not ai_from_metadata
     samsung_only = samsung_genai_type is not None and not ai_from_metadata
 
