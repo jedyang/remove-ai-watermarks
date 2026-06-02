@@ -8,7 +8,9 @@ present.
 **Reverse-alpha based.** A known mark is a fixed semi-transparent overlay, so it
 is removed by inverting the alpha blend against a captured alpha map
 (``original = (wm - a*logo)/(1-a)``) -- recovering the true pixels rather than
-inpainting a guess. Gemini and Doubao recover exactly with no inpaint at native;
+inpainting a guess. Gemini and Doubao recover exactly with no inpaint at native on
+bright/flat backgrounds (Gemini falls back to inpainting the sparkle footprint when
+reverse-alpha would over-subtract on a dark background -- issue #30, see gemini_engine);
 Jimeng adds a thin residual inpaint over the glyph footprint to clear the outline
 its per-image render variation leaves behind (still seeded by the reverse-alpha
 recovery, not a blind inpaint). Detection is consistent with that: each mark is

@@ -230,3 +230,57 @@ class TestInpainting:
         original = image.copy()
         self.engine.inpaint_residual(image, (150, 150, 48, 48))
         np.testing.assert_array_equal(image, original)
+
+
+class TestOverSubtractionGuard:
+    """Issue #30: reverse-alpha must not turn the sparkle into a black pit.
+
+    On a dark background the captured alpha over-estimates the real sparkle opacity,
+    so the fixed-alpha reverse blend over-subtracts and drives the footprint to black.
+    The engine detects this and inpaints the footprint instead.
+    """
+
+    # Composite the mark at ~60% of the captured opacity: the engine's alpha maxes at
+    # ~0.51, real dark-background sparkles sit nearer ~0.31, so 0.6x reproduces the
+    # capture-over-estimates-reality mismatch that triggers the bug.
+    _REALISTIC_ALPHA_SCALE = 0.6
+
+    @pytest.fixture(autouse=True)
+    def _setup_engine(self):
+        self.engine = GeminiEngine()
+
+    def _composite_sparkle(self, bg_value: int, size: int = 1400, alpha_scale: float = _REALISTIC_ALPHA_SCALE):
+        """Build a flat BGR image of ``bg_value`` with the sparkle composited in.
+
+        The mark is composited at a LOWER effective opacity than the engine's captured
+        alpha map (``alpha_scale`` < 1), reproducing the real-world mismatch behind
+        issue #30: the captured alpha (~0.51) over-estimates a real sparkle whose
+        effective opacity is lower, so the fixed-alpha reverse blend over-subtracts.
+        Placed at the configured large-image position so the detector locates it.
+        """
+        img = np.full((size, size, 3), bg_value, dtype=np.float32)
+        config = get_watermark_config(size, size)
+        x, y = config.get_position(size, size)
+        alpha = self.engine.get_alpha_map(WatermarkSize.LARGE)
+        ah, aw = alpha.shape[:2]
+        a = (alpha * alpha_scale)[:, :, None]
+        roi = img[y : y + ah, x : x + aw]
+        img[y : y + ah, x : x + aw] = a * 255.0 + (1.0 - a) * roi
+        return np.clip(img, 0, 255).astype(np.uint8), (x, y, aw, ah)
+
+    def test_dark_background_does_not_leave_black_pit(self):
+        image, (x, y, w, h) = self._composite_sparkle(bg_value=60)
+        out = self.engine.remove_watermark(image)
+        footprint = out[y : y + h, x : x + w]
+        # The recovered footprint must read like the dark background, not a black hole.
+        assert footprint.min() > 25, f"black pit: min={footprint.min()}"
+        assert abs(float(footprint.mean()) - 60.0) < 25.0
+
+    def test_bright_background_keeps_reverse_alpha(self):
+        """A bright background does not over-subtract, so reverse-alpha is used."""
+        bright, pos = self._composite_sparkle(bg_value=230)
+        alpha = self.engine.get_interpolated_alpha(pos[2])
+        assert self.engine._reverse_alpha_oversubtracts(bright, alpha, (pos[0], pos[1])) is False
+        dark, dpos = self._composite_sparkle(bg_value=60)
+        dalpha = self.engine.get_interpolated_alpha(dpos[2])
+        assert self.engine._reverse_alpha_oversubtracts(dark, dalpha, (dpos[0], dpos[1])) is True

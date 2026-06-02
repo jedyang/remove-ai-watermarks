@@ -127,6 +127,17 @@ class GeminiEngine:
     This is a Python port of the GeminiWatermarkTool C++ engine.
     """
 
+    # Footprint pixels with alpha at/above this are the sparkle body; below it the
+    # mark barely affects the pixel, so those are excluded from both the
+    # over-subtraction test and the inpaint mask.
+    _FOOTPRINT_ALPHA = 0.1
+    # If more than this fraction of footprint pixels over-subtract (numerator < 0),
+    # the fixed alpha does not match this image's sparkle and reverse-alpha would
+    # punch a dark pit -- inpaint instead. demo_banana measures 0.0 (reverse-alpha
+    # kept), the issue #30 dark-grass image measures ~0.61 (inpaint), so the 0.05
+    # gate separates them with a wide margin.
+    _OVERSUB_FOOTPRINT_FRAC = 0.05
+
     def __init__(self, logo_value: float = 255.0) -> None:
         """Initialize the engine with embedded alpha maps.
 
@@ -365,7 +376,21 @@ class GeminiEngine:
             detection.confidence,
         )
 
-        self._reverse_alpha_blend(result, alpha_map, pos)
+        # The captured alpha map (max ~0.51 = a ~50%-opaque white sparkle) is exact
+        # only when the real mark's effective opacity matches it. On a dark/textured
+        # background the sparkle's effective alpha is lower than the capture, so the
+        # fixed-alpha reverse blend OVER-subtracts and drives the footprint to black --
+        # the "white sparkle turns into a black pit" bug (issue #30). The signature is
+        # a large fraction of footprint pixels whose numerator (watermarked - a*logo)
+        # goes negative, which is physically impossible under a brightening overlay.
+        # In that case inpaint the small footprint from the surrounding pixels instead;
+        # on a bright background no pixel over-subtracts, so reverse-alpha is used and
+        # the result is byte-identical to before (verified on demo_banana: 0% vs 61%).
+        if self._reverse_alpha_oversubtracts(result, alpha_map, pos):
+            logger.debug("Reverse-alpha over-subtracts on this background; inpainting sparkle footprint.")
+            self._inpaint_footprint(result, alpha_map, pos)
+        else:
+            self._reverse_alpha_blend(result, alpha_map, pos)
         return result
 
     def remove_watermark_custom(
@@ -399,6 +424,84 @@ class GeminiEngine:
         self._reverse_alpha_blend(result, alpha, (x, y))
         return result
 
+    def _footprint_indices(
+        self,
+        alpha_map: NDArray[Any],
+        position: tuple[int, int],
+        image_shape: tuple[int, ...],
+    ) -> tuple[NDArray[Any], tuple[int, int, int, int]] | None:
+        """Return (alpha_roi, (y1, y2, x1, x2)) for the placed footprint, or None.
+
+        Shared by the over-subtraction test and the inpaint mask so both operate on
+        exactly the same clipped, in-bounds region.
+        """
+        x, y = position
+        ah, aw = alpha_map.shape[:2]
+        ih, iw = image_shape[:2]
+        x1, y1 = max(0, x), max(0, y)
+        x2, y2 = min(iw, x + aw), min(ih, y + ah)
+        if x1 >= x2 or y1 >= y2:
+            return None
+        ax1, ay1 = x1 - x, y1 - y
+        alpha_roi = alpha_map[ay1 : ay1 + (y2 - y1), ax1 : ax1 + (x2 - x1)]
+        return alpha_roi, (y1, y2, x1, x2)
+
+    def _reverse_alpha_oversubtracts(
+        self,
+        image: NDArray[Any],
+        alpha_map: NDArray[Any],
+        position: tuple[int, int],
+    ) -> bool:
+        """True when reverse-alpha would drive the footprint dark (issue #30).
+
+        Tests the numerator ``watermarked - alpha*logo`` over the sparkle body: a
+        brightening overlay can never make it negative, so a large negative fraction
+        means the fixed alpha over-estimates this image's opacity.
+        """
+        placed = self._footprint_indices(alpha_map, position, image.shape)
+        if placed is None:
+            return False
+        alpha_roi, (y1, y2, x1, x2) = placed
+        body = alpha_roi >= self._FOOTPRINT_ALPHA
+        if not bool(body.any()):
+            return False
+        roi = image[y1:y2, x1:x2].astype(np.float32)
+        numerator = roi.mean(axis=2) - np.clip(alpha_roi, 0.0, 0.99) * self.logo_value
+        frac = float((numerator[body] < 0).sum()) / float(body.sum())
+        return frac > self._OVERSUB_FOOTPRINT_FRAC
+
+    def _inpaint_footprint(
+        self,
+        image: NDArray[Any],
+        alpha_map: NDArray[Any],
+        position: tuple[int, int],
+    ) -> None:
+        """Inpaint the sparkle body from surrounding pixels, in-place.
+
+        Fallback for backgrounds where reverse-alpha over-subtracts: a small mask of
+        the footprint (alpha >= threshold, dilated) is reconstructed by cv2 NS inpaint
+        from the continuous surroundings, so the sparkle is replaced by plausible
+        background instead of a black pit.
+        """
+        placed = self._footprint_indices(alpha_map, position, image.shape)
+        if placed is None:
+            return
+        alpha_roi, (y1, y2, x1, x2) = placed
+        # Inpaint only a padded crop around the footprint, not the whole image: the
+        # mask is zero outside a ~96x96 corner, so inpainting the full (multi-MP)
+        # image would be ~hundreds of times more work for an identical result. The
+        # padding gives cv2 enough surrounding context to reconstruct the sparkle.
+        ih, iw = image.shape[:2]
+        pad = 24
+        cy1, cy2 = max(0, y1 - pad), min(ih, y2 + pad)
+        cx1, cx2 = max(0, x1 - pad), min(iw, x2 + pad)
+        crop = image[cy1:cy2, cx1:cx2]
+        mask = np.zeros(crop.shape[:2], dtype=np.uint8)
+        mask[y1 - cy1 : y2 - cy1, x1 - cx1 : x2 - cx1] = (alpha_roi >= self._FOOTPRINT_ALPHA).astype(np.uint8) * 255
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.dilate(mask, kernel, iterations=2)
+        image[cy1:cy2, cx1:cx2] = cv2.inpaint(crop, mask, 6, cv2.INPAINT_NS)
+
     def _reverse_alpha_blend(
         self,
         image: NDArray[Any],
@@ -409,22 +512,10 @@ class GeminiEngine:
 
         Formula: original = (watermarked - a * logo) / (1 - a)
         """
-        x, y = position
-        ah, aw = alpha_map.shape[:2]
-        ih, iw = image.shape[:2]
-
-        # Clip to bounds
-        x1 = max(0, x)
-        y1 = max(0, y)
-        x2 = min(iw, x + aw)
-        y2 = min(ih, y + ah)
-
-        if x1 >= x2 or y1 >= y2:
+        placed = self._footprint_indices(alpha_map, position, image.shape)
+        if placed is None:
             return
-
-        # Get ROIs
-        ax1, ay1 = x1 - x, y1 - y
-        alpha_roi = alpha_map[ay1 : ay1 + (y2 - y1), ax1 : ax1 + (x2 - x1)]
+        alpha_roi, (y1, y2, x1, x2) = placed
         image_roi = image[y1:y2, x1:x2].astype(np.float32)
 
         alpha_threshold = 0.002
