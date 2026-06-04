@@ -175,12 +175,15 @@ A controlled study (June 2026, clean v0.8.6 with text/face protection OFF,
 native resolution on this repo's default SDXL pipeline) measured the minimum
 img2img strength that removes the SynthID pixel watermark, verified per image on
 the vendor's own oracle (openai.com/verify for OpenAI, the Gemini app "Verify
-with SynthID" for Google). The test set and per-image results are recorded in
-`data/synthid_corpus/` (manifest `verified_via` = `openai-verify` / `gemini-app`).
+with SynthID" for Google). Each subject is archived in `data/synthid_corpus/` as a
+pos original plus its minimum-clearing cleaned output (manifest `verified_via` =
+`openai-verify` / `gemini-app`), EXCEPT one third-party image from issue #14, which
+was oracle-verified but is not committed (third-party content stays out of the
+public corpus).
 
 | Vendor | Images | Resolution(s) | Pipeline | Removed at |
 |--------|--------|---------------|----------|------------|
-| OpenAI (gpt-image) | n=4 | 1024x1536 .. 1600x1600 | native | **0.05** |
+| OpenAI (gpt-image) | n=4 (3 archived + 1 external-only) | 1024x1536 .. 1600x1600 | native | **0.05** |
 | Google (Gemini)    | n=4 | 2816x1536 -> capped 1536 | `--max-resolution 1536` | **0.15** (0.05 and 0.10 do NOT clear) |
 
 **Two findings, both oracle-verified:**
