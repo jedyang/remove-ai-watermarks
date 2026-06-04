@@ -284,6 +284,9 @@ remove-ai-watermarks invisible image.png -o clean.png --humanize 4.0 --unsharp 0
 # GPU/MPS, cap the long side: --max-resolution 2048
 # Strength is vendor-adaptive by default (OpenAI 0.10 / Google 0.15); override
 # with --strength. To preserve text/face structure, use --pipeline controlnet
+# Or let it choose: --auto picks the pipeline, face restore, and polish from the
+# image content (controlnet when there is text/structure, face restore when a face
+# is present). Explicit flags override it. Experimental.
 # (SDXL + canny ControlNet); tune preservation with --controlnet-scale. Add
 
 # Check / strip AI metadata (C2PA, EXIF, "Made with AI" labels)

@@ -159,6 +159,48 @@ _unsharp_option = click.option(
     "--unsharp", type=float, default=0.0, help="Unsharp-mask sharpening strength (0 = off, typical: 0.3-0.8)."
 )
 
+_auto_option = click.option(
+    "--auto",
+    is_flag=True,
+    default=False,
+    help="Auto-pick quality modes (pipeline, face restore, sharpen/grain) from image content. "
+    "Explicit flags override. EXPERIMENTAL.",
+)
+
+
+def _apply_auto(
+    ctx: click.Context,
+    source: Path,
+    pipeline: str,
+    restore_faces: bool,
+    unsharp: float,
+    humanize: float,
+) -> tuple[str, bool, float, float]:
+    """Resolve ``--auto``: plan modes from the image, overriding only the flags the
+    user left at their default (an explicit flag always wins). Returns the resolved
+    ``(pipeline, restore_faces, unsharp, humanize)`` and prints the chosen plan.
+    """
+    from remove_ai_watermarks import auto_config
+
+    cfg = auto_config.plan(source)
+    if cfg is None:
+        console.print("  Auto: could not read image; using defaults")
+        return pipeline, restore_faces, unsharp, humanize
+
+    def _is_default(name: str) -> bool:
+        return ctx.get_parameter_source(name) == click.core.ParameterSource.DEFAULT
+
+    if _is_default("pipeline"):
+        pipeline = cfg.pipeline
+    if _is_default("restore_faces"):
+        restore_faces = cfg.restore_faces
+    if _is_default("unsharp"):
+        unsharp = cfg.unsharp
+    if _is_default("humanize"):
+        humanize = cfg.humanize
+    console.print(f"  Auto: {cfg.reason}")
+    return pipeline, restore_faces, unsharp, humanize
+
 
 def _restore_faces_options(f: Any) -> Any:
     """Attach the shared GFPGAN face-restoration flags to an invisible-pipeline command."""
@@ -507,6 +549,7 @@ def cmd_erase(
 @_restore_faces_options
 @_min_resolution_option
 @_unsharp_option
+@_auto_option
 @click.pass_context
 def cmd_invisible(
     ctx: click.Context,
@@ -525,6 +568,7 @@ def cmd_invisible(
     controlnet_scale: float,
     restore_faces: bool,
     restore_faces_weight: float,
+    auto: bool,
 ) -> None:
     """Remove invisible AI watermarks (SynthID, StableSignature, TreeRing).
 
@@ -542,6 +586,10 @@ def cmd_invisible(
     from remove_ai_watermarks.invisible_engine import InvisibleEngine
 
     source = _validate_image(source)
+    if auto:
+        pipeline, restore_faces, unsharp, humanize = _apply_auto(
+            ctx, source, pipeline, restore_faces, unsharp, humanize
+        )
     if output is None:
         output = source.with_stem(source.stem + "_clean")
 
@@ -758,6 +806,7 @@ def cmd_identify(ctx: click.Context, source: Path, no_visible: bool, as_json: bo
 @_restore_faces_options
 @_min_resolution_option
 @_unsharp_option
+@_auto_option
 @click.pass_context
 def cmd_all(
     ctx: click.Context,
@@ -779,6 +828,7 @@ def cmd_all(
     controlnet_scale: float,
     restore_faces: bool,
     restore_faces_weight: float,
+    auto: bool,
 ) -> None:
     """Remove ALL watermarks: visible + invisible + metadata.
 
@@ -793,6 +843,10 @@ def cmd_all(
 
     _banner()
     source = _validate_image(source)
+    if auto:
+        pipeline, restore_faces, unsharp, humanize = _apply_auto(
+            ctx, source, pipeline, restore_faces, unsharp, humanize
+        )
 
     if output is None:
         output = source.with_stem(source.stem + "_clean")
