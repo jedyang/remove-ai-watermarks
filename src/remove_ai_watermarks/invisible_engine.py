@@ -406,7 +406,12 @@ class InvisibleEngine:
             restored = instantid_restore.restore_faces_instantid(original_bgr, cleaned_bgr, seed=seed)
             image_io.imwrite(out_path, restored)
         except Exception as e:
-            logger.warning("restore_faces post-pass failed (%s); keeping un-restored output", e)
+            logger.warning(
+                "restore_faces post-pass failed (%s: %s); keeping un-restored output",
+                type(e).__name__,
+                e,
+                exc_info=True,
+            )
 
     def _restore_faces_photomaker(
         self,
