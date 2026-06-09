@@ -100,8 +100,11 @@ class TestRestoreFacesPhotomakerControlFlow:
         size = photomaker_restore._PHOTOMAKER_FACE_SIZE
         fake_face = Image.fromarray(np.full((size, size, 3), fill_value, dtype=np.uint8))
 
+        import torch
+
         class _FakePipe:
             device = "cpu"
+            dtype = torch.float32
 
             def __call__(self, **_kwargs):
                 return SimpleNamespace(images=[fake_face])
@@ -119,8 +122,18 @@ class TestRestoreFacesPhotomakerControlFlow:
         assert np.array_equal(out, cleaned)
 
     def test_one_face_gets_composited_into_cleaned(self, monkeypatch):
+        import sys
+        import types
+
         monkeypatch.setattr(photomaker_restore, "is_available", lambda: True)
         monkeypatch.setattr(photomaker_restore, "_get_pipeline", lambda: self._fake_pipeline_class(fill_value=210))
+        # FaceAnalyser singleton: any non-None object; the test stubs analyze_faces below.
+        monkeypatch.setattr(photomaker_restore, "_get_face_analyser", lambda: object())
+        # Stub `from photomaker import analyze_faces` inside the function: install a
+        # fake `photomaker` module that returns a single 512-d embedding per call.
+        fake_photomaker = types.ModuleType("photomaker")
+        fake_photomaker.analyze_faces = lambda _fa, _bgr: [{"embedding": np.zeros(512, dtype=np.float32)}]
+        monkeypatch.setitem(sys.modules, "photomaker", fake_photomaker)
 
         orig = np.full((400, 400, 3), 30, dtype=np.uint8)
         cleaned = np.full((400, 400, 3), 90, dtype=np.uint8)
