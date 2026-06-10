@@ -67,6 +67,20 @@ MAX_SATURATION = 55  # max channel spread to count a pixel as "grayish"
 LOGO_MIN_LUMA = 150  # glyphs are at least this bright in absolute terms
 TOPHAT_DELTA = 12  # glyph must exceed the local background by this many levels
 
+# Dark-background fallback: ink-wash paintings, night scenes, dark-mode art etc.
+# have an overall low-luma corner where the standard bright-on-brighter detection
+# fails because (a) the absolute luma of the glyph never reaches 150 and/or (b)
+# the tophat against a dark textured background is too small.  The fallback
+# loosens the absolute luma floor and swaps the tophat for a simpler
+# absolute-brightness check (the white/gray glyph IS the brightest thing in a
+# genuinely dark corner).  It is only tried when the primary mask produces too
+# little coverage, and the result is still gated by NCC shape-matching so a
+# plain dark corner won't fire.
+DARK_MIN_COVERAGE = 0.04  # same coverage floor as the primary path
+DARK_MAX_ROI_MEAN_LUMA = 80  # only engage when the whole corner is this dark
+DARK_LOGO_MIN_LUMA = 100  # relaxed absolute luma floor for the glyph
+DARK_LOGO_LUMA_DELTA = 20  # glyph must be at least this much brighter than the ROI median
+
 # Detection is reverse-alpha-consistent: the mark is recognized by matching the
 # bundled alpha-template glyph silhouette (assets/doubao_alpha.png -- the exact
 # shape we invert) against the extracted candidate mask via zero-mean normalized
@@ -266,6 +280,30 @@ class DoubaoEngine:
         glyph = cv2.morphologyEx(glyph, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
         glyph = cv2.morphologyEx(glyph, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
 
+        # ── Dark-background fallback ──
+        # When the primary mask has too little coverage AND the ROI is overall
+        # dark (mean luma <= DARK_MAX_ROI_MEAN_LUMA), the standard
+        # bright-on-brighter detection fails because the glyph's absolute luma
+        # is low and the tophat against a dark textured corner is shallow.
+        # Switch to a relaxed detection: the mark is the grayish region that is
+        # substantially brighter than the ROI median (the glyph IS the
+        # brightest thing in a truly dark corner).  This is still gated by NCC
+        # shape-matching in detect(), so a plain dark corner won't fire.
+        primary_coverage = float((glyph > 0).sum()) / float(max(1, bw * bh))
+        if primary_coverage < DETECT_MIN_COVERAGE and luma.mean() <= DARK_MAX_ROI_MEAN_LUMA:
+            median_luma = float(np.median(luma))
+            dark_cand = grayish & (luma > DARK_LOGO_MIN_LUMA) & (luma > median_luma + DARK_LOGO_LUMA_DELTA)
+            dark_glyph = dark_cand.astype(np.uint8) * 255
+            dark_glyph = cv2.morphologyEx(dark_glyph, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+            dark_glyph = cv2.morphologyEx(dark_glyph, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+            dark_cov = float((dark_glyph > 0).sum()) / float(max(1, bw * bh))
+            logger.debug(
+                "Doubao dark fallback: roi_mean=%.1f primary_cov=%.3f dark_cov=%.3f",
+                luma.mean(), primary_coverage, dark_cov,
+            )
+            if dark_cov > primary_coverage:
+                glyph = dark_glyph
+
         mask = np.zeros((h, w), np.uint8)
         mask[y : y + bh, x : x + bw] = glyph
         return mask
@@ -408,6 +446,37 @@ class DoubaoEngine:
             rm = cv2.dilate((best_amap > _RESIDUAL_ALPHA_FLOOR).astype(np.uint8) * 255, kernel)
             best_out = cv2.inpaint(best_out, rm, _RESIDUAL_INPAINT_RADIUS, cv2.INPAINT_NS)
         return best_out
+
+    def inpaint_force_fallback(self, image: NDArray[Any], region: tuple[int, int, int, int]) -> NDArray[Any]:
+        """Force-mode fallback: after reverse-alpha may have partially removed the
+        watermark, extract the glyph mask from the (possibly already cleaned) image
+        and inpaint over any remaining watermark pixels.
+
+        This handles cases where the alpha template doesn't fully cover the actual
+        watermark -- e.g. dark backgrounds where the template alignment is off.
+        """
+        h, w = image.shape[:2]
+        # Use locate() + extract_mask() on the already-processed image to find
+        # remaining bright watermark pixels.
+        loc = self.locate(image)
+        mask = self.extract_mask(image, loc)
+        x, y, bw, bh = loc.bbox
+        box = mask[y : y + bh, x : x + bw]
+        coverage = float((box > 0).sum()) / float(max(1, bw * bh))
+        if coverage < 0.01:
+            # No significant watermark pixels remain; nothing to do.
+            return image
+
+        # Dilate the mask slightly to cover edges, then inpaint.
+        kernel = np.ones((3, 3), np.uint8)
+        dilated = cv2.dilate(mask, kernel, iterations=2)
+        # Only inpaint within the located region to avoid affecting other areas.
+        roi = image[y : y + bh, x : x + bw]
+        roi_mask = dilated[y : y + bh, x : x + bw]
+        roi_inpainted = cv2.inpaint(roi, roi_mask, 3, cv2.INPAINT_TELEA)
+        result = image.copy()
+        result[y : y + bh, x : x + bw] = roi_inpainted
+        return result
 
 
 def load_image_bgr(path: str | Path) -> NDArray[Any]:

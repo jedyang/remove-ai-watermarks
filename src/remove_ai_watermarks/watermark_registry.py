@@ -173,7 +173,14 @@ def _doubao_remove(
     engine = _engine("doubao")
     det = engine.detect(image)
     if (det.detected or force) and engine.reverse_alpha_available(image):
-        return engine.remove_watermark_reverse_alpha(image), (det.region if det.detected else None)
+        result = engine.remove_watermark_reverse_alpha(image)
+        # When force mode is used and detection failed, the reverse-alpha may
+        # only partially remove the watermark (alpha template may not fully
+        # cover the actual mark). Follow up with a mask-based inpaint over the
+        # detected glyph region to clear the remaining watermark.
+        if force and not det.detected:
+            result = engine.inpaint_force_fallback(result, det.region)
+        return result, (det.region if det.detected else None)
     return image.copy(), None
 
 
