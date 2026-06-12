@@ -1,5 +1,12 @@
 # SynthID-robust face identity for an SDXL removal pipeline (research)
 
+> **Status (2026-06-08): retired.** Every approach described below was empirically
+> tested and rejected -- see `docs/synthid-robust-identity-research-2026-06-08.md`
+> "Empirical follow-up" for the final conclusion. The library no longer ships any
+> face-restore extra: the cleaned image from the main controlnet 0.20 pass is the
+> least-AI face state we can reach without re-introducing SynthID. This document
+> is kept as historical record of the exploration.
+
 **Question.** Which face identity-preservation mechanism for an SDXL img2img +
 canny-ControlNet watermark-removal pipeline (denoise 0.20-0.30) is BOTH (a)
 commercial-safe end-to-end and (b) does not re-introduce the SynthID pixel

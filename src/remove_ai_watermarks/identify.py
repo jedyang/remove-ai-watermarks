@@ -30,6 +30,7 @@ from remove_ai_watermarks.metadata import (
     IPTC_AI_FIELD_MARKERS,
     IPTC_AI_MARKERS,
     aigc_label,
+    c2pa_cloud_manifest_in,
     c2pa_marker_in,
     exif_generator,
     get_ai_metadata,
@@ -95,6 +96,13 @@ _HF_JOB_CAVEAT = (
     "The hf-job-id tag marks a HuggingFace-hosted job (commonly diffusion "
     "generation) but names neither the model nor the content type, so it is a "
     "medium-confidence signal, not proof the pixels are AI-generated."
+)
+_C2PA_CLOUD_CAVEAT = (
+    "The embedded C2PA manifest is absent but an XMP provenance pointer to the "
+    "vendor's cloud manifest store survives, so the Content Credentials remain "
+    "recoverable server-side -- stripping the file no longer removes the provenance. "
+    "It marks Content Credentials, not AI origin: the cloud manifest may describe a "
+    "human edit, and reading it needs a network fetch this tool does not make."
 )
 _SAMSUNG_GENAI_CAVEAT = (
     "Samsung's genAIType marker shows a Galaxy AI editing tool (Generative Edit, "
@@ -285,7 +293,12 @@ def _vendor_of(text: str | None) -> str | None:
 # chain like Adobe over a Gemini original) legitimately names several vendors in
 # one valid chain and must not read as spoofing. Families not listed here are each
 # their own independent source (EXIF/XMP generator, IPTC AISystemUsed, AIGC, ...).
-_CLASH_SOURCE: dict[str, str] = {"c2pa": "c2pa_manifest", "synthid": "c2pa_manifest"}
+# The single C2PA-manifest source shared by the issuer attribution and the SynthID
+# proxy (both inferred from the same embedded manifest). Rule 2 keys off it too:
+# the camera device label is read from this manifest, so an AI marker is a clash
+# only when its source differs from this (i.e. it is genuinely independent).
+_C2PA_MANIFEST_SOURCE = "c2pa_manifest"
+_CLASH_SOURCE: dict[str, str] = {"c2pa": _C2PA_MANIFEST_SOURCE, "synthid": _C2PA_MANIFEST_SOURCE}
 
 
 def _integrity_clashes(
@@ -326,7 +339,16 @@ def _integrity_clashes(
             + " -- one provenance set was likely spoofed, transplanted, or laundered."
         )
 
-    if camera_label and camera_has_ai_marker:
+    # Rule 2: a camera-capture C2PA device next to an AI-generation marker. Only
+    # an AI marker from a source INDEPENDENT of the camera's own C2PA manifest is
+    # a contradiction. A device that both captures and runs on-device generative
+    # AI (Google Pixel Magic Editor / Pixel Studio) records the capture and the
+    # AI edit in ONE manifest, so the AI vendor is named only from that same
+    # manifest (c2pa issuer + synthid proxy) -- a legitimate edit chain, not a
+    # spoof. An EXIF/XMP generator, IPTC field, TC260 AIGC label, or second
+    # manifest naming AI on a camera capture is the real laundering tell.
+    independent_ai_marker = any(grp != _C2PA_MANIFEST_SOURCE for grp in source.values())
+    if camera_label and camera_has_ai_marker and independent_ai_marker:
         vendors = ", ".join(sorted(set(ai_vendors.values()))) or "present"
         clashes.append(
             f"Camera-capture C2PA credentials ({camera_label}) coexist with AI-generation markers "
@@ -482,6 +504,21 @@ def identify(image_path: Path, *, check_visible: bool = True, check_invisible: b
         # e.g. "Google Pixel", would mis-normalize to an AI vendor).
         if c2pa_is_ai and (v := (_vendor_of(_attribute_platform(issuers, is_ai=True)) or _vendor_of(generator))):
             ai_vendor_claims["c2pa"] = v
+
+    # ── C2PA cloud-manifest reference (Durable Content Credentials) ─
+    # An XMP dcterms:provenance pointer to a vendor manifest store survives even
+    # when the embedded manifest is stripped, so the credentials stay recoverable
+    # server-side (C2PA 2.4). Provenance only -- it does NOT assert AI (the cloud
+    # manifest may describe a human edit), so it is excluded from ai_from_metadata
+    # and the clash vendors. Skip when an embedded manifest already attributed it.
+    if not has_c2pa and (cloud_vendor := c2pa_cloud_manifest_in(head)):
+        signals.append(Signal("c2pa_cloud", f"cloud manifest store: {cloud_vendor}", "medium"))
+        watermarks.append(
+            f"C2PA Durable Content Credentials (cloud manifest at {cloud_vendor}; embedded manifest absent)"
+        )
+        caveats.append(_C2PA_CLOUD_CAVEAT)
+        if platform is None:
+            platform = f"C2PA signer: {cloud_vendor} (cloud manifest)"
 
     # ── SynthID metadata proxy ──────────────────────────────────────
     # get_ai_metadata already sets synthid_watermark for both PNG (caBX parser)

@@ -59,6 +59,32 @@ class TestUnicodeRoundTrip:
         assert np.array_equal(out, src)
 
 
+class TestToBgr:
+    def test_grayscale_2d_promoted_to_bgr(self) -> None:
+        gray = np.full((4, 5), 120, dtype=np.uint8)
+        out = image_io.to_bgr(gray)
+        assert out.shape == (4, 5, 3)
+        # GRAY2BGR replicates the channel, so all three match the source.
+        assert np.array_equal(out[..., 0], gray)
+        assert np.array_equal(out[..., 0], out[..., 2])
+
+    def test_single_channel_3d_promoted(self) -> None:
+        gray = np.full((4, 5, 1), 7, dtype=np.uint8)
+        assert image_io.to_bgr(gray).shape == (4, 5, 3)
+
+    def test_bgra_dropped_to_bgr(self) -> None:
+        bgra = np.zeros((4, 5, 4), dtype=np.uint8)
+        bgra[..., :3] = (10, 120, 240)
+        out = image_io.to_bgr(bgra)
+        assert out.shape == (4, 5, 3)
+        assert np.array_equal(out, bgra[..., :3])
+
+    def test_bgr_returned_unchanged(self) -> None:
+        bgr = _make_bgr()
+        out = image_io.to_bgr(bgr)
+        assert out is bgr  # 3-channel: no copy
+
+
 class TestFailureSemantics:
     def test_missing_file_returns_none(self, tmp_path: Path) -> None:
         assert image_io.imread(tmp_path / "does-not-exist-不存在.png") is None

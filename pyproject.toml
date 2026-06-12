@@ -1,19 +1,48 @@
 [project]
 name = "remove-ai-watermarks"
-version = "0.8.9"
-description = "Remove visible and invisible AI watermarks from images (Gemini / Nano Banana, ChatGPT, Stable Diffusion)"
+version = "0.11.0"
+description = "AI watermark remover: strip visible and invisible AI watermarks (Gemini / Nano Banana sparkle, SynthID) and provenance metadata (C2PA, EXIF) from images"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = {text = "Apache-2.0"}
+keywords = [
+    "ai-watermark",
+    "ai-watermark-remover",
+    "watermark-remover",
+    "watermark-removal",
+    "remove-watermark",
+    "synthid",
+    "c2pa",
+    "content-credentials",
+    "nano-banana",
+    "gemini",
+    "gemini-watermark",
+    "ai-metadata",
+    "metadata-removal",
+    "provenance",
+    "exif",
+    "stable-diffusion",
+    "comfyui",
+    "ai-detection",
+]
 classifiers = [
-    "License :: OSI Approved :: MIT License",
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Multimedia :: Graphics",
+    "Topic :: Multimedia :: Graphics :: Graphics Conversion",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Scientific/Engineering :: Image Processing",
+    "Topic :: Security",
+    "Topic :: Utilities",
 ]
 dependencies = [
     "pillow>=10.0.0",
@@ -76,27 +105,6 @@ lama = [
     "onnxruntime>=1.16.0",
     "huggingface-hub>=0.20.0",
 ]
-# **NON-COMMERCIAL.** Optional PhotoMaker-V2 SynthID-robust face-identity post-pass.
-# PhotoMaker-V2's ID encoder pulls an InsightFace ArcFace embedding at runtime, and
-# the pretrained InsightFace model packs (antelopev2, buffalo_l) are released under a
-# non-commercial / research-only license. A paid service (raiw.cc, any monetized SaaS)
-# MUST NOT use this extra. See `src/remove_ai_watermarks/photomaker_restore.py` and
-# `docs/synthid-robust-identity-research.md`. The PhotoMaker adapter weights
-# (photomaker-v2.bin) are Apache-2.0 and download on first use; the InsightFace model
-# packs download on first FaceAnalysis() (only triggered inside PhotoMaker's V2 forward).
-# Pins beyond the upstream PhotoMaker package itself patch missing declarations that
-# would otherwise break the load chain (verified empirically via the Modal cert sweep
-# 2026-06-04): einops (used in forward), peft (required by diffusers.fuse_lora),
-# onnxruntime (transitive via insightface), and insightface itself (required for the
-# package's __init__.py to even import).
-photomaker = [
-    "photomaker @ git+https://github.com/TencentARC/PhotoMaker.git",
-    "huggingface-hub>=0.20.0",
-    "einops>=0.7.0",
-    "insightface>=0.7.3",
-    "onnxruntime>=1.16.0",
-    "peft>=0.10.0",
-]
 # Optional pre-diffusion super-resolution for small inputs (Real-ESRGAN). Loaded via
 # spandrel (MIT) -- a pure model-loader with NO basicsr dependency (it pulls only
 # torch / torchvision / safetensors / numpy / einops).
@@ -112,18 +120,16 @@ esrgan = [
 dev = [
     "pytest>=8.0.0",
     "pytest-cov>=4.1.0",
+    "pytest-xdist>=3.5.0",
     "ruff>=0.4.0",
     "pyright>=1.1.0",
     "invisible-watermark>=0.2.0",
+    # maintain.sh helpers; they only support newer Pythons, so gate them by
+    # marker to keep the py3.10 resolution (and CI matrix) solvable.
+    "uv-outdated>=0.1.0; python_version >= '3.12'",
+    "uv-secure>=0.12.0; python_version >= '3.12'",
 ]
 all = ["remove-ai-watermarks[gpu,detect,trustmark,lama,dev]"]
-
-# diffusers 0.38.0 (security fix for GHSA-98h9-4798-4q5v) declares a dependency
-# on safetensors>=0.8.0rc0 — a pre-release. Allow pre-releases globally so the
-# resolver can satisfy that. Drop once diffusers publishes a release with a
-# stable safetensors pin (or once safetensors 0.8.0 stable is out).
-[tool.uv]
-prerelease = "allow"
 
 # PyTorch Intel-GPU (XPU) wheel index. ``explicit = true`` keeps it inert for
 # the default CPU/CUDA install: uv consults it only when a torch install
@@ -141,25 +147,8 @@ remove-ai-watermarks = "remove_ai_watermarks.cli:main"
 Repository = "https://github.com/wiltodelta/remove-ai-watermarks"
 
 [build-system]
-# Pin hatchling < 1.31. hatchling 1.30.0 made Metadata-Version 2.5 (PEP 794) the
-# default, which the twine bundled in pypa/gh-action-pypi-publish@release/v1 rejects
-# ("'2.5' is not a valid Metadata-Version"), failing the v0.8.3 PyPI upload
-# (2026-06-01) when unpinned requires = ["hatchling"] pulled 1.30.0. hatchling 1.30.1
-# reverted the default to 2.4 ("kept at 2.4 until more tools support 2.5"), and
-# 1.27-1.29 were always 2.4 -- so < 1.31 keeps `uv build` on a 2.4-emitting hatchling
-# (it resolves to the latest allowed, 1.30.1). The publish workflow now uses
-# `uv publish`, whose uploader accepts 2.5, so this pin is belt-and-suspenders, not
-# load-bearing: keeping it makes the first uv-publish release ship 2.4 metadata
-# (isolating the uploader swap from the metadata-version bump). Drop to
-# `requires = ["hatchling"]` once that release confirms the path.
-requires = ["hatchling<1.31"]
+requires = ["hatchling"]
 build-backend = "hatchling.build"
-
-# Allow the `photomaker` extra to reference the upstream git URL directly (the
-# TencentARC/PhotoMaker package is not on PyPI). The extra itself is NON-COMMERCIAL
-# (see the photomaker block above and `photomaker_restore.py`).
-[tool.hatch.metadata]
-allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/remove_ai_watermarks"]

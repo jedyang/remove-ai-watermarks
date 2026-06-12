@@ -124,6 +124,19 @@ class TestGeminiEngine:
         result = self.engine.remove_watermark_custom(image, (10, 10, 48, 48))
         assert result.shape == image.shape
 
+    def test_detect_on_grayscale_does_not_crash(self):
+        # A 2D grayscale array reaching detect_watermark (registry adapter / library
+        # API) must not crash the FP-gate's axis=2 reduction; it is normalized to BGR.
+        gray = np.full((300, 300), 100, dtype=np.uint8)
+        result = self.engine.detect_watermark(gray)
+        assert result is not None
+
+    def test_remove_on_bgra_returns_3_channel(self):
+        bgra = np.zeros((300, 300, 4), dtype=np.uint8)
+        bgra[..., 3] = 255
+        result = self.engine.remove_watermark(bgra)
+        assert result.shape == (300, 300, 3)
+
     def test_remove_watermark_custom_large_region(self, tmp_image_path):
         image = cv2.imread(str(tmp_image_path), cv2.IMREAD_COLOR)
         result = self.engine.remove_watermark_custom(image, (10, 10, 96, 96))

@@ -19,6 +19,8 @@ import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .noai.watermark_profiles import DEFAULT_MODEL_ID as DEFAULT_SDXL_MODEL_ID
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -37,9 +39,9 @@ logger = logging.getLogger(__name__)
 
 def is_available() -> bool:
     """Check if invisible watermark removal dependencies are installed."""
-    import importlib.util
+    from .optional_deps import module_available
 
-    return importlib.util.find_spec("diffusers") is not None and importlib.util.find_spec("torch") is not None
+    return module_available("diffusers", "torch")
 
 
 def _target_size(width: int, height: int, max_resolution: int, min_resolution: int = 0) -> tuple[int, int] | None:
@@ -83,13 +85,13 @@ class InvisibleEngine:
 
     # SDXL base is the default since May 2026; the vendor-adaptive strength
     # removes the current SynthID (see watermark_profiles + docs/synthid.md).
-    DEFAULT_MODEL_ID = "stabilityai/stable-diffusion-xl-base-1.0"
+    DEFAULT_MODEL_ID = DEFAULT_SDXL_MODEL_ID
 
     def __init__(
         self,
         model_id: str | None = None,
         device: str | None = None,
-        pipeline: str = "default",
+        pipeline: str = "controlnet",
         hf_token: str | None = None,
         progress_callback: Callable[[str], None] | None = None,
         controlnet_conditioning_scale: float = 1.0,
@@ -99,9 +101,10 @@ class InvisibleEngine:
         Args:
             model_id: HuggingFace model ID. None = use the SDXL base default.
             device: Device for inference (auto/cpu/mps/cuda/xpu). None = auto.
-            pipeline: Pipeline profile. "default" (plain SDXL img2img) or
-                "controlnet" (SDXL + canny ControlNet that preserves text/face
-                structure via edge conditioning while removing SynthID).
+            pipeline: Pipeline profile. "controlnet" (DEFAULT; SDXL + canny ControlNet
+                that preserves text/face structure via edge conditioning while removing
+                SynthID) or "sdxl" (plain SDXL img2img, lighter but leaves SynthID on
+                flat-graphic content). "default" is a back-compat alias for "sdxl".
             hf_token: HuggingFace API token.
             progress_callback: Optional callback for progress messages.
             controlnet_conditioning_scale: ControlNet structure-preservation
@@ -164,7 +167,6 @@ class InvisibleEngine:
         max_resolution: int = 0,
         min_resolution: int = 1024,
         vendor: str | None = None,
-        restore_faces: bool = False,
         unsharp: float = 0.0,
         adaptive_polish: bool = False,
         upscaler: str = "lanczos",
@@ -176,25 +178,18 @@ class InvisibleEngine:
             output_path: Output path (None = overwrite source).
             strength: Denoising strength (0.0-1.0). None -> the vendor-adaptive
                 default.
-            steps: Number of denoising steps.
+            num_inference_steps: Number of denoising steps.
             guidance_scale: Classifier-free guidance scale.
             seed: Random seed for reproducibility.
             humanize: Intensity of Analog Humanizer film grain (0 = off).
-            restore_faces: EXPERIMENTAL, opt-in (default False). **NON-COMMERCIAL.**
-                Run the PhotoMaker-V2 face-identity post-pass when faces are present
-                (needs the ``photomaker`` extra, which pulls non-commercial InsightFace
-                model packs). Auto-skips with a debug log when the extra is absent or no
-                face is detected. See ``photomaker_restore.py`` for the legal notice.
             unsharp: Final unsharp-mask sharpening strength (0 = off, default).
-                Applied last (after face restoration) to counter the soft,
-                over-smoothed look of the diffusion + restoration; ~0.5-0.8 is a
-                safe range, higher risks edge halos.
-            adaptive_polish: When True (the --auto mode default), restore the input's
-                detail level in the softened output instead of fixed unsharp/humanize:
-                a capped unsharp + edge-masked grain targeting the input's Laplacian
-                variance (self-limiting on text/graphics). Runs LAST, after face
-                restoration. The fixed ``humanize``/``unsharp`` knobs are normally 0
-                when this is on.
+                Applied last to counter the soft / over-smoothed look of the
+                diffusion pass; ~0.5-0.8 is a safe range, higher risks edge halos.
+            adaptive_polish: When True (the CLI default), restore the input's detail
+                level in the softened output: a capped unsharp + edge-masked grain
+                targeting the input's Laplacian variance. Self-limiting -- a no-op when
+                the output already meets the input's detail level (text/flat graphics),
+                so it only acts on over-smoothed photo/face texture. Runs LAST.
             max_resolution: Cap the long side (px) before diffusion. 0 (default)
                 = no cap. Set a positive value only to bound GPU/MPS memory on
                 very large inputs (it reintroduces a lossy downscale->upscale
@@ -268,8 +263,14 @@ class InvisibleEngine:
                 vendor=vendor,
             )
 
-            # Post-processing: optional Humanizer, then restore original resolution.
-            if humanize > 0.0:
+            # Post-processing chain: decode the diffusion output ONCE, apply the
+            # optional stages in memory in order (humanize -> restore original
+            # resolution -> unsharp -> adaptive polish), and write ONCE. Previously
+            # each stage independently imread/imwrote the full-res output, so a run
+            # with several stages PNG-decoded+re-encoded the same image 2-4 times.
+            # PNG is lossless, so the single-write output is byte-identical.
+            needs_restore = target is not None  # the input was resized before diffusion
+            if humanize > 0.0 or unsharp > 0.0 or adaptive_polish or needs_restore:
                 import cv2
 
                 from remove_ai_watermarks import image_io
@@ -278,126 +279,49 @@ class InvisibleEngine:
                 if out_cv is None:
                     return out_path
 
-                if self._progress_callback:
-                    self._progress_callback(f"Applying Analog Humanizer (grain: {humanize})...")
-                from remove_ai_watermarks.humanizer import apply_analog_humanizer
+                if humanize > 0.0:
+                    if self._progress_callback:
+                        self._progress_callback(f"Applying Analog Humanizer (grain: {humanize})...")
+                    from remove_ai_watermarks.humanizer import apply_analog_humanizer
 
-                out_cv = apply_analog_humanizer(out_cv, grain_intensity=humanize, chromatic_shift=1)
+                    out_cv = apply_analog_humanizer(out_cv, grain_intensity=humanize, chromatic_shift=1)
 
-                # Restore original resolution
+                # Restore original resolution if the input was resized for diffusion.
                 if (out_cv.shape[1], out_cv.shape[0]) != orig_size:
                     if self._progress_callback:
                         self._progress_callback(
                             f"Upscaling result back to original resolution {orig_size[0]}x{orig_size[1]}..."
                         )
-                    # Using INTER_LANCZOS4 for high-quality upscaling back to original
                     out_cv = cv2.resize(out_cv, orig_size, interpolation=cv2.INTER_LANCZOS4)
 
-                image_io.imwrite(out_path, out_cv)
-
-            else:
-                # No humanize: still restore the original size if it was capped.
-                import cv2
-
-                from remove_ai_watermarks import image_io
-
-                out_cv = image_io.imread(out_path, cv2.IMREAD_COLOR)
-                if out_cv is not None and (out_cv.shape[1], out_cv.shape[0]) != orig_size:
-                    if self._progress_callback:
-                        self._progress_callback(
-                            f"Upscaling result back to original resolution {orig_size[0]}x{orig_size[1]}..."
-                        )
-                    out_cv = cv2.resize(out_cv, orig_size, interpolation=cv2.INTER_LANCZOS4)
-                    image_io.imwrite(out_path, out_cv)
-
-            # Optional GFPGAN face-polish post-pass: sharpens and re-synthesizes each
-            # face from GFPGAN's StyleGAN2 prior, running on the DIFFUSION-CLEANED image
-            # (not the original) -- so SynthID is not re-introduced (the input pixels
-            # GFPGAN derives from are already SynthID-free). Auto-skips when faces are
-            # absent or the optional `restore` extra is not installed.
-            if restore_faces:
-                self._restore_faces_photomaker(out_path, image, seed)
-
-            # Final sharpening, LAST so it crisps the face-restored result too (a
-            # pre-restore sharpen would be smoothed back over by the face pass).
-            if unsharp > 0.0:
-                import cv2
-
-                from remove_ai_watermarks import image_io
-                from remove_ai_watermarks.humanizer import unsharp_mask
-
-                out_cv = image_io.imread(out_path, cv2.IMREAD_COLOR)
-                if out_cv is not None:
+                if unsharp > 0.0:
                     if self._progress_callback:
                         self._progress_callback(f"Sharpening (unsharp mask: {unsharp})...")
-                    image_io.imwrite(out_path, unsharp_mask(out_cv, amount=unsharp))
+                    from remove_ai_watermarks.humanizer import unsharp_mask
 
-            # Adaptive polish (--auto): restore the input's detail level in the softened
-            # output, sparing text/edges. Replaces the fixed unsharp/humanize knobs.
-            if adaptive_polish:
-                import cv2
-                import numpy as np
+                    out_cv = unsharp_mask(out_cv, amount=unsharp)
 
-                from remove_ai_watermarks import humanizer, image_io
+                # Adaptive polish (CLI default): restore the input's detail level in the
+                # softened output, sparing text/edges. Self-limiting where no deficit.
+                if adaptive_polish:
+                    import numpy as np
 
-                out_cv = image_io.imread(out_path, cv2.IMREAD_COLOR)
-                if out_cv is not None:
+                    from remove_ai_watermarks import humanizer
+
                     ref = cv2.cvtColor(np.array(reference_pil.convert("RGB")), cv2.COLOR_RGB2BGR)
                     if (ref.shape[1], ref.shape[0]) != (out_cv.shape[1], out_cv.shape[0]):
                         ref = cv2.resize(ref, (out_cv.shape[1], out_cv.shape[0]), interpolation=cv2.INTER_LANCZOS4)
                     if self._progress_callback:
                         self._progress_callback("Adaptive polish (sharpen + grain to the input's detail level)...")
-                    image_io.imwrite(out_path, humanizer.adaptive_polish(out_cv, ref, seed=seed))
+                    out_cv = humanizer.adaptive_polish(out_cv, ref, seed=seed)
+
+                image_io.imwrite(out_path, out_cv)
 
             return out_path
         finally:
             # _tmp_path is always set above (we persist the image unconditionally).
             if _tmp_path.exists():
                 _tmp_path.unlink()
-
-    def _restore_faces_photomaker(
-        self,
-        out_path: Path,
-        original_image: Any,
-        seed: int | None,
-    ) -> None:
-        """Run the PhotoMaker-V2 face-identity post-pass on the cleaned ``out_path``.
-
-        **NON-COMMERCIAL** (see ``photomaker_restore.py``). PhotoMaker carries identity
-        in a CLIP+ArcFace embedding and regenerates fresh face pixels conditioned on
-        it, so the watermark is not transported. Best-effort: any failure (missing
-        extra, model load, runtime error) logs a warning and leaves the un-restored
-        cleaned output in place.
-        """
-        from remove_ai_watermarks import photomaker_restore
-
-        if not photomaker_restore.is_available():
-            logger.debug("restore_faces requested but the 'photomaker' extra is not installed; skipping")
-            return
-
-        try:
-            import cv2
-            import numpy as np
-
-            from remove_ai_watermarks import image_io
-
-            cleaned_bgr = image_io.imread(out_path, cv2.IMREAD_COLOR)
-            if cleaned_bgr is None:
-                logger.warning("restore_faces: could not read cleaned output %s; skipping", out_path)
-                return
-
-            original_rgb = original_image.convert("RGB")
-            original_bgr = cv2.cvtColor(np.array(original_rgb), cv2.COLOR_RGB2BGR)
-            cleaned_size = (cleaned_bgr.shape[1], cleaned_bgr.shape[0])
-            if (original_bgr.shape[1], original_bgr.shape[0]) != cleaned_size:
-                original_bgr = cv2.resize(original_bgr, cleaned_size, interpolation=cv2.INTER_LANCZOS4)
-
-            if self._progress_callback:
-                self._progress_callback("Restoring face identity (PhotoMaker-V2 post-pass)...")
-            restored = photomaker_restore.restore_faces_photomaker(original_bgr, cleaned_bgr, seed=seed)
-            image_io.imwrite(out_path, restored)
-        except Exception as e:
-            logger.warning("restore_faces post-pass failed (%s); keeping un-restored output", e)
 
     def remove_watermark_batch(
         self,

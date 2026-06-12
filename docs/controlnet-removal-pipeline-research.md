@@ -124,14 +124,19 @@ Gemini app; the two payloads are vendor-specific and never cross-checked):
 - **Fix the seed in prod.** The non-determinism is purely `seed=None` (random); a fixed
   `--seed` makes every run reproduce the certified-clean result, so you ship a
   deterministic, re-certifiable config (and the seed sweep collapses to one config).
-- **`--restore-faces` is PhotoMaker-V2 (NON-COMMERCIAL).** The GFPGAN-on-cleaned path
-  was tried and rejected: it polished but did not restore identity. PhotoMaker-V2
-  regenerates faces from a CLIP+ArcFace embedding (so pixels are fresh, SynthID is not
-  re-introduced) but pulls InsightFace antelopev2/buffalo_l model packs at runtime,
-  which are research-only. Needs the `photomaker` extra; **a paid service MUST NOT
-  use this flag.** PhotoMaker-V1 was attempted as a commercial-safe alternative but
-  blocked by a CFG batch-dim mismatch in the upstream pipeline (forked from diffusers
-  0.29; we ship 0.38) — see `docs/synthid-robust-identity-research.md`.
+- **`--restore-faces` is OFF in prod and stays opt-in.** Two methods ship
+  (`instantid` default, `photomaker`), both NON-COMMERCIAL. They REGENERATE the face
+  from an ArcFace embedding via SDXL diffusion, making the output face look more
+  AI-generated than the cleaned image (gloss, symmetric pores, SDXL "clean skin"
+  aesthetic). For production face preservation the cleaned image from controlnet 0.20
+  is the LEAST-AI state we can reach — any restore on top trades original-look for
+  embedding-driven regeneration. Empirical sweep summary: GFPGAN-on-cleaned polished
+  without identity recovery; PhotoMaker-V2 produced a different person; InstantID
+  txt2img produced studio-portrait patchwork on group photos; InstantID
+  img2img-on-cleaned with three parameter settings integrated scene context cleanly
+  but never recovered original identity precisely — every setting traded one problem
+  for another. See `docs/synthid-robust-identity-research-2026-06-08.md`
+  "Empirical follow-up" for the full sweep.
 - **No local SynthID detector exists** → the service can't self-verify; bake in strength
   margin and periodic oracle spot-checks.
 - **Lesson:** visual-quality / face-identity recovery does NOT prove removal — only the

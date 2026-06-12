@@ -24,6 +24,7 @@ Entries:
   - ``doubao`` -- ByteDance Doubao "豆包AI生成" text strip, bottom-right.
   - ``jimeng`` -- ByteDance Jimeng / Dreamina "★ 即梦AI" wordmark, bottom-right.
   - ``samsung`` -- Samsung Galaxy AI "Contenuti generati dall'AI" strip, bottom-left.
+  - ``aigc_label`` -- Generic "AI生成" / AIGC label, top-left (inpaint removal).
 """
 
 from __future__ import annotations
@@ -172,9 +173,14 @@ def _gemini_remove(
     return result, det.region
 
 
-def _doubao_detect(image: NDArray[Any]) -> MarkDetection:
-    d = _engine("doubao").detect(image)
-    return MarkDetection("doubao", "Doubao 豆包AI生成 text", "bottom-right", d.detected, d.confidence, d.region)
+# ── Text-mark engine adapters (Doubao/Jimeng/Samsung share the TextMarkEngine interface) ──
+
+def _text_mark_detect(key: str, label: str, location: str) -> Callable[[NDArray[Any]], MarkDetection]:
+    def detect(image: NDArray[Any]) -> MarkDetection:
+        d = _engine(key).detect(image)
+        return MarkDetection(key, label, location, d.detected, d.confidence, d.region)
+
+    return detect
 
 
 def _doubao_remove(
@@ -263,7 +269,7 @@ def _aigc_label_remove(
 _REGISTRY: tuple[KnownMark, ...] = (
     KnownMark("gemini", "Google Gemini sparkle", "bottom-right", True, "reverse-alpha", _gemini_detect, _gemini_remove),
     KnownMark(
-        "doubao", "Doubao 豆包AI生成 text", "bottom-right", True, "reverse-alpha", _doubao_detect, _doubao_remove
+        "doubao", "Doubao 豆包AI生成 text", "bottom-right", True, "reverse-alpha", _text_mark_detect("doubao", "Doubao 豆包AI生成 text", "bottom-right"), _doubao_remove
     ),
     KnownMark(
         "jimeng", "Jimeng 即梦AI wordmark", "bottom-right", True, "reverse-alpha", _jimeng_detect, _jimeng_remove

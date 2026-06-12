@@ -382,12 +382,10 @@ the payload, reconstituting SynthID in text. The lesson held and shaped the
 current design: **content is preserved by REGENERATING it under structural
 conditioning, never by copying original pixels.**
 
-Both preservation features below are **EXPERIMENTAL and opt-in (off by default)**;
-the plain `default` SDXL img2img pass is the shippable path.
-
-- **Text + structure:** `--pipeline controlnet` (SDXL img2img + a canny ControlNet,
-  experimental/opt-in) conditions the regeneration on the edge map, so text and
-  structure stay sharp while every pixel is still regenerated. Text legibility is
+- **Text + structure:** `--pipeline controlnet` (SDXL img2img + a canny ControlNet) is
+  **THE DEFAULT pipeline since 2026-06-09** (`--pipeline default` opts down to plain
+  SDXL img2img for inputs without text/faces). It conditions the regeneration on the
+  edge map, so text and structure stay sharp while every pixel is still regenerated. Text legibility is
   better than plain img2img at the same strength (text stays readable where plain
   garbles it). **BUT removal efficacy at the low vendor-adaptive strength is CONTENT ×
   PIPELINE dependent and NEITHER pipeline clears all content -- oracle-validated
@@ -407,7 +405,13 @@ the plain `default` SDXL img2img pass is the shippable path.
   removal guarantee at today's strength -- pick by what you must PRESERVE (controlnet
   for text/structure), then raise strength until the oracle reads clean. (The earlier
   "reads clean on the oracle" claim held only for the one flat/text-background case it
-  was checked on; it does not generalize.)
+  was checked on; it does not generalize.) **UPDATE 2026-06-09: the default strengths
+  were raised and made pipeline-aware (controlnet ladder = the certified
+  0.20/0.30/0.30 floors, applied to BOTH pipelines as a single ladder -- see §5.2 for
+  why one ladder covers plain `sdxl` too) and controlnet is now the default pipeline.
+  The plain-SDXL profile was also renamed `default` -> `sdxl` (`default` stays as an
+  alias). The 0.10/0.15 numbers in this analysis are the PRE-raise values it was
+  measured at. See §5.2.**
 - **Face identity:** canny holds face *structure* but not *identity*. Shipped as the
   optional `--restore-faces` GFPGAN post-pass (`face_restore.py`, the `restore`
   extra, experimental/opt-in, off by default). It runs GFPGAN on the ORIGINAL
@@ -448,14 +452,25 @@ study (section 2.2) gives empirical floors:
   resolution stack). Use a GPU or `--max-resolution 1536`.
 
 The default is **vendor-adaptive** (`watermark_profiles.resolve_strength` +
-`vendor_for_strength`): the tool reads the C2PA issuer on the original input and
-picks `OPENAI_STRENGTH` 0.10 / `GEMINI_STRENGTH` 0.15 / `UNKNOWN_STRENGTH` 0.15.
-This uses the vendor signal we DO have locally (the C2PA SynthID proxy) to avoid
-the overkill of a single high default on OpenAI images, without needing a local
-pixel detector. An explicit `--strength` always wins. If the watermark still
-survives (e.g. a large native Gemini beyond the capped-1536 validation), raise
-toward 0.30 then 0.35-0.40 (0.40 visibly corrupts dense text), using the lowest
-value that reads clean on the oracle.
+`vendor_for_strength`): the tool reads the C2PA issuer on the original input and picks
+`OPENAI_STRENGTH` 0.20 / `GEMINI_STRENGTH` 0.30 / `UNKNOWN_STRENGTH` 0.30. **The SAME
+ladder applies to both pipelines** (`sdxl` and `controlnet`) -- these are the
+oracle-certified controlnet floors (§5.5, the 2026-06-04 Modal cert). Why one ladder
+covers plain `sdxl` too: the certification was run on controlnet and does NOT transfer
+by symmetry (the two pipelines have OPPOSITE hard cases -- controlnet leaves SynthID on
+photoreal, `sdxl` on flat graphics, the §5.1 content-x-pipeline table), BUT on its own
+hard case (flat fills) `sdxl` is the WEAKER remover (plain img2img barely perturbs a
+flat region at low strength), so it needs AT LEAST controlnet's strength -- the
+certified floor is therefore the right floor for `sdxl` too. This is a MARGIN argument
+for `sdxl`, not a separate certification (no local SynthID detector to self-verify).
+The higher strength costs little quality where it matters, because `controlnet` is now
+the default pipeline, so `sdxl` is reached only via an explicit `--pipeline sdxl` (a
+deliberate opt-down), where over-regeneration has no faces/text to damage.
+This uses the vendor signal we DO have locally (the C2PA SynthID proxy) to avoid the
+overkill of a single high default on OpenAI images, without needing a local pixel
+detector. An explicit `--strength` always wins. If the watermark still survives (e.g. a
+large native Gemini beyond the capped-1536 validation), raise toward 0.35-0.40 (0.40
+visibly corrupts dense text), using the lowest value that reads clean on the oracle.
 
 ### 5.3 Test methodology
 

@@ -18,14 +18,18 @@ from typing import TYPE_CHECKING, Any, Literal
 import click
 
 from remove_ai_watermarks import __version__, watermark_registry
-from remove_ai_watermarks.noai.watermark_profiles import resolve_strength, vendor_for_strength
+from remove_ai_watermarks.noai.constants import SUPPORTED_FORMATS
+from remove_ai_watermarks.noai.watermark_profiles import (
+    resolve_strength,
+    strength_default_help,
+    vendor_for_strength,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Generator
 
     from numpy.typing import NDArray
 
-    from remove_ai_watermarks.gemini_engine import DetectionResult
 
 # --- plain-text output layer (replaces rich: no colors, no markup, no boxes) ---
 
@@ -103,8 +107,6 @@ Progress = _Progress
 SpinnerColumn = BarColumn = TextColumn = TimeElapsedColumn = _column
 console = _Console()
 
-SUPPORTED_FORMATS = {".png", ".jpg", ".jpeg", ".webp"}
-
 
 def _setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.WARNING
@@ -143,8 +145,8 @@ _controlnet_scale_option = click.option(
     "--controlnet-scale",
     type=float,
     default=1.0,
-    help="ControlNet conditioning scale (structure/text preservation strength), controlnet pipeline "
-    "only (EXPERIMENTAL).",
+    help="ControlNet conditioning scale (structure/text preservation strength); "
+    "applies to the controlnet pipeline (the default). Higher = closer to original structure.",
 )
 
 _min_resolution_option = click.option(
@@ -173,51 +175,103 @@ _auto_option = click.option(
     "--auto",
     is_flag=True,
     default=False,
-    help="Auto-pick the pipeline, face restore, and adaptive polish from image content. "
-    "Every choice is overridable -- an explicit --pipeline / --restore-faces / --adaptive-polish "
-    "always wins. EXPERIMENTAL.",
+    help="DEPRECATED: controlnet is already the default pipeline, so --auto now only "
+    "enables --adaptive-polish (the content detectors were removed). Use "
+    "--adaptive-polish instead.",
 )
 
 _adaptive_polish_option = click.option(
     "--adaptive-polish/--no-adaptive-polish",
-    default=False,
+    default=True,
     help="Restore the input's detail level after removal (capped unsharp + edge-masked grain "
-    "targeting the input's sharpness, sparing text). On by default under --auto; pass "
-    "--no-adaptive-polish to disable it there, or --adaptive-polish to use it without --auto. "
-    "Independent of the fixed --unsharp/--humanize. EXPERIMENTAL.",
+    "targeting the input's sharpness, sparing text), countering the over-smoothed look. ON by "
+    "default; it self-limits where there is no detail deficit (text/flat graphics), so it is a "
+    "no-op there. Pass --no-adaptive-polish to disable. Independent of --unsharp/--humanize.",
+)
+
+# HuggingFace model + CFG knobs, shared by the diffusion commands (invisible/all/batch)
+# so the surface stays identical across them.
+_model_option = click.option(
+    "--model",
+    type=str,
+    default=None,
+    help="HuggingFace model ID for the diffusion pipeline. Default: the SDXL base checkpoint.",
+)
+_guidance_scale_option = click.option(
+    "--guidance-scale",
+    type=float,
+    default=None,
+    help="Classifier-free guidance scale (CFG). Default: 7.5 (the library default). "
+    "Lower = follow the prompt less / stay closer to the input.",
 )
 
 
-def _apply_auto(
-    ctx: click.Context,
-    source: Path,
-    pipeline: str,
-    restore_faces: bool,
-    adaptive_polish: bool,
-) -> tuple[str, bool, bool]:
-    """Resolve ``--auto``: plan the three content-adaptive modes (pipeline, face
-    restore, adaptive polish) from the image, overriding only the ones the user left
-    at their default (an explicit flag always wins). The fixed ``--unsharp``/
-    ``--humanize`` filters are independent and untouched. Prints the chosen plan.
+def _normalize_pipeline(ctx: click.Context, param: click.Parameter, value: str | None) -> str | None:
+    """Resolve the legacy ``default`` profile name to ``sdxl`` (click option callback).
+
+    Emits a one-line deprecation notice when the user explicitly passes the outdated
+    ``default`` value, pointing at the two current choices (``sdxl`` / ``controlnet``).
     """
-    from remove_ai_watermarks import auto_config
+    if value is None:
+        return None
+    from remove_ai_watermarks.noai.watermark_profiles import normalize_profile
 
-    cfg = auto_config.plan(source)
-    if cfg is None:
-        console.print("  Auto: could not read image; using defaults")
-        return pipeline, restore_faces, adaptive_polish
+    normalized = normalize_profile(value)
+    if value.strip().lower() == "default":
+        click.echo(
+            "Warning: --pipeline default is deprecated and maps to 'sdxl'. "
+            "Use --pipeline sdxl (plain SDXL) or --pipeline controlnet (the default).",
+            err=True,
+        )
+    return normalized
 
-    def _is_default(name: str) -> bool:
-        return ctx.get_parameter_source(name) == click.core.ParameterSource.DEFAULT
 
-    if _is_default("pipeline"):
-        pipeline = cfg.pipeline
-    if _is_default("restore_faces"):
-        restore_faces = cfg.restore_faces
-    if _is_default("adaptive_polish"):
-        adaptive_polish = cfg.adaptive_polish
-    console.print(f"  Auto: {cfg.reason}")
-    return pipeline, restore_faces, adaptive_polish
+# ``controlnet`` (the default-SELECTED value) and ``sdxl`` (plain SDXL img2img) are the
+# two current profiles; ``default`` is an OUTDATED back-compat alias for ``sdxl``
+# (warned + normalized away by _normalize_pipeline).
+_PIPELINE_CHOICES = ["sdxl", "controlnet", "default"]
+_PIPELINE_HELP = (
+    "Pipeline profile. controlnet (DEFAULT) = SDXL + canny ControlNet that preserves "
+    "text/faces via edge conditioning while removing SynthID; sdxl = plain SDXL img2img "
+    "(lighter, no extra model download, but leaves SynthID on flat-graphic content). "
+    "('default' is an OUTDATED alias for 'sdxl' -- use sdxl or controlnet.)"
+)
+
+# Shared --pipeline / --strength decorators so the three diffusion commands
+# (invisible/all/batch) keep an identical surface and the strength help can never
+# drift from the watermark_profiles constants (strength_default_help derives it).
+_pipeline_option = click.option(
+    "--pipeline",
+    type=click.Choice(_PIPELINE_CHOICES),
+    default="controlnet",
+    callback=_normalize_pipeline,
+    help=_PIPELINE_HELP,
+)
+_strength_option = click.option(
+    "--strength",
+    type=float,
+    default=None,
+    help=f"Denoising strength (0.0-1.0). Default: {strength_default_help()}.",
+)
+
+
+def _resolve_auto_polish(auto: bool, adaptive_polish: bool) -> bool:
+    """Warn on the retired ``--auto`` flag, returning ``adaptive_polish`` unchanged.
+
+    ``--auto`` used to plan the pipeline + polish from content detection, but the
+    pipeline is now always controlnet (the default) and the adaptive polish is ON by
+    default (it self-gates by detail level), so the content detectors were removed and
+    ``--auto`` is now a no-op alias: the polish it used to enable is already the default,
+    and an explicit ``--no-adaptive-polish`` still wins. So it only emits a deprecation
+    warning and passes ``adaptive_polish`` through.
+    """
+    if auto:
+        click.echo(
+            "Warning: --auto is deprecated and now does nothing (the adaptive polish it "
+            "enabled is ON by default). Use --no-adaptive-polish to turn the polish off.",
+            err=True,
+        )
+    return adaptive_polish
 
 
 def _warn_if_esrgan_unavailable(upscaler: str) -> None:
@@ -235,33 +289,32 @@ def _warn_if_esrgan_unavailable(upscaler: str) -> None:
         console.print("  Note: --upscaler esrgan needs the 'esrgan' extra; falling back to Lanczos.")
 
 
-def _restore_faces_options(f: Any) -> Any:
-    """Attach the face-restoration flag to an invisible-pipeline command.
+def _remove_visible_auto(
+    image: NDArray[Any],
+    *,
+    inpaint: bool = True,
+    inpaint_method: str = "ns",
+    inpaint_strength: float = 0.85,
+) -> tuple[NDArray[Any], str | None]:
+    """Remove the strongest auto-detected visible mark via the registry.
 
-    The post-pass uses PhotoMaker-V2 to regenerate each face from a CLIP+ArcFace
-    embedding. **NON-COMMERCIAL** -- PhotoMaker-V2 pulls InsightFace antelopev2/
-    buffalo_l model packs at runtime, which are research-only. A paid service
-    (raiw.cc, any monetized SaaS) MUST NOT use this flag.
+    Routes the ``all``/``batch`` visible step through the same registry path the
+    standalone ``visible`` command uses, so EVERY registered mark is handled (the
+    Gemini sparkle AND the Doubao/Jimeng/Samsung text marks), not just the sparkle.
+    Returns ``(result, label-or-None)``; when no ``in_auto`` mark fires the image is
+    returned unchanged with ``None``. ``inpaint*`` tune the Gemini edge-residual
+    cleanup only (the text engines ignore them).
     """
-    return click.option(
-        "--restore-faces/--no-restore-faces",
-        default=False,
-        help="EXPERIMENTAL, opt-in, **NON-COMMERCIAL** -- needs the 'photomaker' extra "
-        "which pulls non-commercial InsightFace model packs. Restores face identity via "
-        "PhotoMaker-V2 (CLIP+ArcFace embedding -> fresh face); off by default, auto-skips "
-        "when no face is detected or the extra is absent.",
-    )(f)
+    from remove_ai_watermarks import watermark_registry
 
-
-def _watermark_region(det: DetectionResult, width: int, height: int) -> tuple[int, int, int, int]:
-    """Pick a watermark bbox: detector's region if confident, else the default config slot."""
-    if det.confidence > 0.15:
-        return det.region
-    from remove_ai_watermarks.gemini_engine import get_watermark_config
-
-    config = get_watermark_config(width, height)
-    px, py = config.get_position(width, height)
-    return (px, py, config.logo_size, config.logo_size)
+    best = watermark_registry.best_auto_mark(image)
+    if best is None:
+        return image, None
+    method: Literal["telea", "ns"] = "ns" if inpaint_method == "ns" else "telea"
+    result, _ = watermark_registry.get_mark(best.key).remove(
+        image, inpaint_method=method, inpaint=inpaint, inpaint_strength=inpaint_strength, force=False
+    )
+    return result, best.label
 
 
 def _read_bgr_and_alpha(path: Path) -> tuple[NDArray[Any] | None, NDArray[Any] | None]:
@@ -545,21 +598,9 @@ def cmd_erase(
 @click.option(
     "-o", "--output", type=click.Path(path_type=Path), default=None, help="Output path (default: <source>_clean.<ext>)."
 )
-@click.option(
-    "--strength",
-    type=float,
-    default=None,
-    help="Denoising strength (0.0-1.0). Default: vendor-adaptive (OpenAI 0.10 / Google 0.15 / "
-    "unknown 0.15, from the C2PA issuer).",
-)
+@_strength_option
 @click.option("--steps", type=int, default=50, help="Number of denoising steps. Default: 50.")
-@click.option(
-    "--pipeline",
-    type=click.Choice(["default", "controlnet"]),
-    default="default",
-    help="Pipeline profile (default=SDXL img2img; controlnet=SDXL + canny ControlNet that preserves "
-    "text/faces via edge conditioning while removing SynthID, EXPERIMENTAL).",
-)
+@_pipeline_option
 @click.option(
     "--device",
     type=click.Choice(["auto", "cpu", "mps", "cuda", "xpu"]),
@@ -578,10 +619,11 @@ def cmd_erase(
     help="Cap long side (px) before diffusion; 0 = native (best quality, like raiw.cc). Raise only on GPU/MPS OOM.",
 )
 @_controlnet_scale_option
-@_restore_faces_options
 @_min_resolution_option
 @_unsharp_option
 @_upscaler_option
+@_model_option
+@_guidance_scale_option
 @_auto_option
 @_adaptive_polish_option
 @click.pass_context
@@ -600,8 +642,9 @@ def cmd_invisible(
     max_resolution: int,
     min_resolution: int,
     controlnet_scale: float,
-    restore_faces: bool,
     upscaler: str,
+    model: str | None,
+    guidance_scale: float | None,
     auto: bool,
     adaptive_polish: bool,
 ) -> None:
@@ -622,8 +665,7 @@ def cmd_invisible(
 
     source = _validate_image(source)
     _warn_if_esrgan_unavailable(upscaler)
-    if auto:
-        pipeline, restore_faces, adaptive_polish = _apply_auto(ctx, source, pipeline, restore_faces, adaptive_polish)
+    adaptive_polish = _resolve_auto_polish(auto, adaptive_polish)
     if output is None:
         output = source.with_stem(source.stem + "_clean")
 
@@ -633,6 +675,7 @@ def cmd_invisible(
         console.print(f"  {msg}")
 
     engine = InvisibleEngine(
+        model_id=model,
         device=device_str,
         pipeline=pipeline,
         hf_token=hf_token,
@@ -653,7 +696,7 @@ def cmd_invisible(
         output_path=output,
         strength=strength,
         num_inference_steps=steps,
-        guidance_scale=None,
+        guidance_scale=guidance_scale,
         seed=seed,
         humanize=humanize,
         unsharp=unsharp,
@@ -662,7 +705,6 @@ def cmd_invisible(
         min_resolution=min_resolution,
         upscaler=upscaler,
         vendor=vendor,
-        restore_faces=restore_faces,
     )
     elapsed = time.monotonic() - t0
 
@@ -805,21 +847,10 @@ def cmd_identify(ctx: click.Context, source: Path, no_visible: bool, as_json: bo
 @click.option(
     "--inpaint-method", type=click.Choice(["ns", "telea", "gaussian"]), default="ns", help="Inpainting method."
 )
-@click.option(
-    "--strength",
-    type=float,
-    default=None,
-    help="Invisible watermark denoising strength. Default: vendor-adaptive (OpenAI 0.10 / Google 0.15 / unknown 0.15).",
-)
+@_strength_option
 @click.option("--steps", type=int, default=50, help="Number of denoising steps for invisible removal.")
-@click.option(
-    "--pipeline",
-    type=click.Choice(["default", "controlnet"]),
-    default="default",
-    help="Pipeline profile (default=SDXL img2img; controlnet=SDXL + canny ControlNet that preserves "
-    "text/faces via edge conditioning while removing SynthID, EXPERIMENTAL).",
-)
-@click.option("--model", type=str, default=None, help="HuggingFace model ID for invisible removal.")
+@_pipeline_option
+@_model_option
 @click.option(
     "--device",
     type=click.Choice(["auto", "cpu", "mps", "cuda", "xpu"]),
@@ -838,10 +869,10 @@ def cmd_identify(ctx: click.Context, source: Path, no_visible: bool, as_json: bo
     help="Cap long side (px) before diffusion; 0 = native (best quality, like raiw.cc). Raise only on GPU/MPS OOM.",
 )
 @_controlnet_scale_option
-@_restore_faces_options
 @_min_resolution_option
 @_unsharp_option
 @_upscaler_option
+@_guidance_scale_option
 @_auto_option
 @_adaptive_polish_option
 @click.pass_context
@@ -863,8 +894,8 @@ def cmd_all(
     max_resolution: int,
     min_resolution: int,
     controlnet_scale: float,
-    restore_faces: bool,
     upscaler: str,
+    guidance_scale: float | None,
     auto: bool,
     adaptive_polish: bool,
 ) -> None:
@@ -877,18 +908,22 @@ def cmd_all(
 
     If invisible watermark deps are not installed, skips step 2 with a warning.
     """
-    from remove_ai_watermarks.gemini_engine import GeminiEngine
-
     _banner()
     source = _validate_image(source)
     _warn_if_esrgan_unavailable(upscaler)
-    if auto:
-        pipeline, restore_faces, adaptive_polish = _apply_auto(ctx, source, pipeline, restore_faces, adaptive_polish)
+    adaptive_polish = _resolve_auto_polish(auto, adaptive_polish)
 
     if output is None:
         output = source.with_stem(source.stem + "_clean")
 
     t0 = time.monotonic()
+
+    # Tracks whether step 2 (invisible / SynthID removal) was skipped because the
+    # GPU extra is missing. A skipped step 2 still produces an output file (visible
+    # mark + metadata stripped), so without a loud end-of-run notice + non-zero exit
+    # the user mistakes it for a clean result and ships an image that still carries
+    # the invisible watermark (recurring reports: #14, #47).
+    synthid_skipped = False
 
     # Use a temp file for intermediate results so the user doesn't see
     # a partial output file during long model downloads.
@@ -903,7 +938,6 @@ def cmd_all(
 
         # -- Step 1: Visible watermark --------------------------------
         console.print("\n  1) Visible watermark removal")
-        engine = GeminiEngine()
         image, alpha = _read_bgr_and_alpha(source)
         if image is None:
             console.print(f"Error: Failed to read image: {source}")
@@ -913,15 +947,10 @@ def cmd_all(
         console.print(f"    Input: {source.name}  ({w}x{h})")
 
         with console.status("Removing visible watermark..."):
-            det = engine.detect_watermark(image)
-            if det.detected:
-                result = engine.remove_watermark(image)
-                if inpaint:
-                    region = _watermark_region(det, w, h)
-                    result = engine.inpaint_residual(result, region, method=inpaint_method)
-                console.print("    Visible watermark removed")
+            result, removed_label = _remove_visible_auto(image, inpaint=inpaint, inpaint_method=inpaint_method)
+            if removed_label is not None:
+                console.print(f"    Visible watermark removed ({removed_label})")
             else:
-                result = image.copy()
                 console.print("    Skipped (no visible watermark detected)")
 
         # Save to temp file for invisible engine input (preserve alpha if present)
@@ -932,6 +961,7 @@ def cmd_all(
         from remove_ai_watermarks.invisible_engine import is_available as invisible_available
 
         if not invisible_available():
+            synthid_skipped = True
             console.print(
                 "    Warning: Skipped - GPU dependencies not installed.\n"
                 "    Install them with: pip install 'remove-ai-watermarks[gpu]'"
@@ -963,6 +993,7 @@ def cmd_all(
                 output_path=tmp_path,
                 strength=strength,
                 num_inference_steps=steps,
+                guidance_scale=guidance_scale,
                 seed=seed,
                 humanize=humanize,
                 unsharp=unsharp,
@@ -971,7 +1002,6 @@ def cmd_all(
                 min_resolution=min_resolution,
                 upscaler=upscaler,
                 vendor=vendor,
-                restore_faces=restore_faces,
             )
             console.print("    Invisible watermark removed")
 
@@ -1006,6 +1036,24 @@ def cmd_all(
     size_kb = output.stat().st_size / 1024
     console.print(f"\n  Done: {output}  ({size_kb:.0f} KB, {elapsed:.1f}s total)")
 
+    # A skipped invisible step is the single most common "it didn't work" report:
+    # the output looks processed but still carries the SynthID watermark. Make that
+    # impossible to miss -- a prominent banner plus a non-zero exit so scripts and
+    # batch callers can detect the incomplete run instead of trusting the file.
+    if synthid_skipped:
+        console.print(
+            "\n  =====================================================================\n"
+            "  WARNING: the invisible (SynthID) watermark was NOT removed.\n"
+            "  Step 2 was skipped because the GPU dependencies are not installed,\n"
+            "  so this output still carries the invisible watermark -- only the\n"
+            "  visible mark and metadata were stripped.\n"
+            "\n"
+            "  Install the extra and rerun to remove it:\n"
+            "    pip install 'remove-ai-watermarks[gpu]'\n"
+            "  ====================================================================="
+        )
+        raise SystemExit(1)
+
 
 # -- Batch command ----------------------------------------------------
 
@@ -1026,10 +1074,10 @@ def _process_batch_image(
     unsharp: float = 0.0,
     max_resolution: int = 0,
     min_resolution: int = 1024,
-    restore_faces: bool = False,
     controlnet_scale: float = 1.0,
     upscaler: str = "lanczos",
-    auto: bool = False,
+    model: str | None = None,
+    guidance_scale: float | None = None,
     adaptive_polish: bool = False,
 ) -> None:
     """Process a single image for batch mode.
@@ -1043,27 +1091,15 @@ def _process_batch_image(
     saved_alpha: NDArray[Any] | None = None
 
     if mode in ("visible", "all"):
-        from remove_ai_watermarks.gemini_engine import GeminiEngine
-
-        if "_vis_engine" not in ctx.obj:
-            ctx.obj["_vis_engine"] = GeminiEngine()
-        engine = ctx.obj["_vis_engine"]
-        read_path = img_path
-        if mode == "all" and out_path.exists():
-            read_path = out_path
-        image, alpha = _read_bgr_and_alpha(read_path)
+        # Always read the ORIGINAL source: the visible pass is the first step, so a
+        # stale out_path from a previous run must not be re-processed as if it were
+        # the input. (The invisible step below reads out_path for `all` -- that chain
+        # is within a single run.)
+        image, alpha = _read_bgr_and_alpha(img_path)
         if image is None:
             raise ValueError("Failed to read image")
 
-        det = engine.detect_watermark(image)
-        if det.detected:
-            result = engine.remove_watermark(image)
-            if inpaint:
-                h, w = image.shape[:2]
-                region = _watermark_region(det, w, h)
-                result = engine.inpaint_residual(result, region)
-        else:
-            result = image.copy()
+        result, _ = _remove_visible_auto(image, inpaint=inpaint)
 
         _write_bgr_with_alpha(out_path, result, alpha)
         saved_alpha = alpha
@@ -1076,16 +1112,12 @@ def _process_batch_image(
         if invisible_available():
             from remove_ai_watermarks.invisible_engine import InvisibleEngine
 
-            # --auto re-plans the pipeline / face-restore / polish per image; only the
-            # pipeline choice changes the engine ctor, so cache one engine per pipeline
-            # (controlnet vs default) rather than a single shared instance.
-            if auto:
-                pipeline, restore_faces, adaptive_polish = _apply_auto(
-                    ctx, img_path, pipeline, restore_faces, adaptive_polish
-                )
+            # Cache the engine in ctx.obj so the batch builds it once (pipeline is a
+            # single CLI value, constant across the run).
             engines = ctx.obj.setdefault("_inv_engines", {})
             if pipeline not in engines:
                 engines[pipeline] = InvisibleEngine(
+                    model_id=model,
                     device=None if device == "auto" else device,
                     pipeline=pipeline,
                     hf_token=hf_token,
@@ -1097,6 +1129,7 @@ def _process_batch_image(
                 out_path,
                 strength=strength,
                 num_inference_steps=steps,
+                guidance_scale=guidance_scale,
                 seed=seed,
                 humanize=humanize,
                 unsharp=unsharp,
@@ -1104,7 +1137,6 @@ def _process_batch_image(
                 max_resolution=max_resolution,
                 min_resolution=min_resolution,
                 upscaler=upscaler,
-                restore_faces=restore_faces,
                 # Detect the vendor from the pristine original (`img_path`), not the
                 # visible-processed `out_path` whose C2PA is already gone.
                 vendor=vendor_for_strength(img_path),
@@ -1135,19 +1167,13 @@ def _process_batch_image(
 @click.option(
     "--mode", type=click.Choice(["visible", "invisible", "metadata", "all"]), default="visible", help="Processing mode."
 )
-@click.option("--strength", type=float, default=None, help="Denoising strength (invisible mode).")
+@_strength_option
 @click.option("--steps", type=int, default=50, help="Number of denoising steps (invisible mode).")
 @click.option("--inpaint/--no-inpaint", default=True, help="Apply inpainting (visible mode).")
 @click.option(
     "--humanize", type=float, default=0.0, help="Analog Humanizer film grain intensity (0 = off, typical: 2.0-6.0)."
 )
-@click.option(
-    "--pipeline",
-    type=click.Choice(["default", "controlnet"]),
-    default="default",
-    help="Pipeline profile (default=SDXL img2img; controlnet=SDXL + canny ControlNet that preserves "
-    "text/faces via edge conditioning while removing SynthID, EXPERIMENTAL).",
-)
+@_pipeline_option
 @click.option(
     "--device",
     type=click.Choice(["auto", "cpu", "mps", "cuda", "xpu"]),
@@ -1162,11 +1188,12 @@ def _process_batch_image(
     default=0,
     help="Cap long side (px) before diffusion; 0 = native (best quality, like raiw.cc). Raise only on GPU/MPS OOM.",
 )
-@_restore_faces_options
 @_min_resolution_option
 @_unsharp_option
 @_upscaler_option
 @_controlnet_scale_option
+@_model_option
+@_guidance_scale_option
 @_auto_option
 @_adaptive_polish_option
 @click.pass_context
@@ -1186,9 +1213,10 @@ def cmd_batch(
     unsharp: float,
     max_resolution: int,
     min_resolution: int,
-    restore_faces: bool,
     controlnet_scale: float,
     upscaler: str,
+    model: str | None,
+    guidance_scale: float | None,
     auto: bool,
     adaptive_polish: bool,
 ) -> None:
@@ -1210,6 +1238,7 @@ def cmd_batch(
     console.print(f"  Mode: {mode}")
     if mode in ("invisible", "all"):
         _warn_if_esrgan_unavailable(upscaler)
+    adaptive_polish = _resolve_auto_polish(auto, adaptive_polish)
 
     processed = 0
     errors = 0
@@ -1245,10 +1274,10 @@ def cmd_batch(
                     unsharp=unsharp,
                     max_resolution=max_resolution,
                     min_resolution=min_resolution,
-                    restore_faces=restore_faces,
                     controlnet_scale=controlnet_scale,
                     upscaler=upscaler,
-                    auto=auto,
+                    model=model,
+                    guidance_scale=guidance_scale,
                     adaptive_polish=adaptive_polish,
                 )
                 processed += 1

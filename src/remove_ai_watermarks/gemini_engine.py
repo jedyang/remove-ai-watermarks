@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING, Any, Literal
 import cv2
 import numpy as np
 
+from remove_ai_watermarks import image_io
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -337,6 +339,11 @@ class GeminiEngine:
         """Detect Gemini watermark in a specific corner."""
         result = DetectionResult()
 
+        # Normalize to 3-channel BGR: the multi-scale search tolerates grayscale, but
+        # the FP-gate / alpha-gain helpers (_core_and_bg) reduce over axis=2 and would
+        # crash on a 2D/BGRA input reaching this public entry point (e.g. via the
+        # registry detect adapter or the library API).
+        image = image_io.to_bgr(image)
         h, w = image.shape[:2]
         base_size = force_size or get_watermark_size(w, h)
         result.size = base_size
@@ -561,17 +568,10 @@ class GeminiEngine:
             Cleaned BGR image as numpy array, or an unmodified copy when no
             watermark is detected.
         """
-        result = image.copy()
-
         # Normalize to 3-channel BGR up front: 2D grayscale (no channel axis) and
         # 4-channel BGRA both reach this public entry point and would otherwise
         # crash on the channel-count checks / downstream 3-channel math.
-        if result.ndim == 2:
-            result = cv2.cvtColor(result, cv2.COLOR_GRAY2BGR)
-        elif result.shape[2] == 4:
-            result = cv2.cvtColor(result, cv2.COLOR_BGRA2BGR)
-        elif result.shape[2] == 1:
-            result = cv2.cvtColor(result, cv2.COLOR_GRAY2BGR)
+        result = image_io.to_bgr(image.copy())
 
         size = force_size or get_watermark_size(result.shape[1], result.shape[0])
 
@@ -634,7 +634,9 @@ class GeminiEngine:
         Returns:
             Cleaned BGR image.
         """
-        result = image.copy()
+        # Same channel normalization as remove_watermark: the reverse-alpha blend
+        # assumes 3-channel BGR (a grayscale/BGRA input would mis-broadcast).
+        result = image_io.to_bgr(image.copy())
         x, y, rw, rh = region
 
         # Check standard sizes

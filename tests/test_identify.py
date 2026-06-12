@@ -772,6 +772,31 @@ class TestIntegrityClashesHelper:
         # must NOT raise a clash.
         assert _integrity_clashes({}, "Leica (camera, C2PA capture)", camera_has_ai_marker=False) == []
 
+    def test_pixel_generative_edit_same_manifest_no_clash(self):
+        # A Google Pixel that BOTH captures and runs on-device generative AI
+        # (Magic Editor / Pixel Studio) records the capture and the AI edit in
+        # ONE C2PA manifest -- the AI vendor is named only from that same
+        # manifest (c2pa / synthid), independent of nothing. That is a legitimate
+        # edit chain, NOT a camera-vs-AI contradiction, so rule 2 must stay quiet.
+        assert (
+            _integrity_clashes(
+                {"c2pa": "Google", "synthid": "Google"},
+                "Google Pixel (camera, C2PA capture)",
+                camera_has_ai_marker=True,
+            )
+            == []
+        )
+
+    def test_camera_plus_independent_ai_marker_still_clashes(self):
+        # But a camera capture next to an AI marker from a genuinely INDEPENDENT
+        # source (EXIF/XMP generator, TC260 AIGC, ...) is still a laundering tell.
+        clashes = _integrity_clashes(
+            {"c2pa": "Google", "aigc": "China AIGC (TC260)"},
+            "Google Pixel (camera, C2PA capture)",
+            camera_has_ai_marker=True,
+        )
+        assert any("Camera-capture" in c for c in clashes)
+
 
 class TestIntegrityClashEndToEnd:
     def _c2pa_jpeg(self, tmp_path: Path, blob: bytes) -> Path:
@@ -805,6 +830,22 @@ class TestIntegrityClashEndToEnd:
         r = identify(path, check_visible=False, check_invisible=False)
         assert r.platform == "Google Pixel (camera, C2PA capture)"
         assert any("Camera-capture C2PA credentials" in c and "AI-generation markers" in c for c in r.integrity_clashes)
+
+    def test_pixel_generative_edit_no_clash(self, tmp_path: Path):
+        # A real Google Pixel generative edit (Magic Editor / Pixel Studio) signs
+        # ONE manifest carrying both the Pixel Camera capture and a Google
+        # Generative AI edit (trainedAlgorithmicMedia + "Applied imperceptible
+        # SynthID watermark"). The AI marker lives in the SAME manifest as the
+        # device, so it is an edit chain, not a camera-vs-AI contradiction.
+        path = self._c2pa_jpeg(
+            tmp_path,
+            b"Pixel Camera ... Created by Pixel Camera ... computationalCapture ... "
+            b"Created by Google Generative AI ... trainedAlgorithmicMedia ... "
+            b"Applied imperceptible SynthID watermark",
+        )
+        r = identify(path, check_visible=False, check_invisible=False)
+        assert r.is_ai_generated is True
+        assert r.integrity_clashes == []
 
     def test_clash_serializes_to_json(self, tmp_path: Path):
         path = self._c2pa_jpeg(tmp_path, b"OpenAI ... trainedAlgorithmicMedia ... TC260:AIGC label")

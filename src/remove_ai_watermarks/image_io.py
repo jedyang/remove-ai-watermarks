@@ -49,6 +49,25 @@ def imread(path: str | Path, flags: int | None = None) -> NDArray[Any] | None:
     return cv2.imdecode(data, flags)
 
 
+def to_bgr(image: NDArray[Any]) -> NDArray[Any]:
+    """Return a 3-channel BGR view of ``image``, promoting grayscale and BGRA.
+
+    The cv2-based engines (sparkle + the reverse-alpha text marks) assume a
+    3-channel BGR array for their channel reductions (``mean(axis=2)``, the
+    per-pixel logo subtraction). A 2D grayscale or 4-channel BGRA input -- a real
+    Gemini-app export is opaque RGBA -- would otherwise crash or mis-broadcast.
+    Centralizes the shape coercion that was inlined across the engines. A 3-channel
+    input is returned unchanged (no copy).
+    """
+    import cv2
+
+    if image.ndim == 2 or image.shape[2] == 1:
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    if image.shape[2] == 4:
+        return cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+    return image
+
+
 def imwrite(path: str | Path, img: NDArray[Any]) -> bool:
     """Unicode-safe ``cv2.imwrite``.
 

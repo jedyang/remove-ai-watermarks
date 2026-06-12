@@ -9,6 +9,7 @@ For metadata-only operations, the heavy ML dependencies are NOT required.
 from __future__ import annotations
 
 import contextlib
+import functools
 import logging
 import re
 import struct
@@ -18,6 +19,11 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Smaller scan_head window for the cheap marker checks (has_ai_metadata,
+# samsung_genai); the full-detail scans use scan_head's 1 MB default. Sharing
+# one constant also keeps both call sites on the same memoized cache entry.
+_QUICK_SCAN_BYTES = 512 * 1024
 
 # ── Known AI metadata keys ──────────────────────────────────────────
 
@@ -209,7 +215,10 @@ def _png_late_metadata(image_path: Path, window: int) -> bytes:
                 if chunk_type in _PNG_META_CHUNKS and data_start >= window:
                     f.seek(data_start)
                     out += f.read(safe_length)
-                pos = data_start + length + 4  # data + CRC
+                # Advance by the CLAMPED length: a malformed/inflated `length` that
+                # overshoots EOF must not push `pos` past the file and abort the scan
+                # (which would silently skip a genuine AI-label chunk after it).
+                pos = data_start + safe_length + 4  # data + CRC
     except OSError as exc:
         logger.debug("PNG late-metadata scan failed on %s: %s", image_path, exc)
         return b""
@@ -227,7 +236,29 @@ def scan_head(image_path: Path, size: int = 1024 * 1024) -> bytes:
     non-faststart MP4 manifest, or a PNG XMP packet appended after the pixels --
     which a fixed first-MB read would miss. For other inputs, and for files that
     fit within ``size``, it is exactly ``f.read(size)`` -- behavior-neutral.
+
+    The result is memoized per (path, size, mtime): one ``identify``/``get_ai_metadata``
+    call fans out to ~8 byte-scan detectors that each call this on the same file, so
+    the cache turns those repeated reads into one. The mtime key invalidates the entry
+    when the file changes; the small ``maxsize`` bounds memory to a few MB.
     """
+    try:
+        mtime = image_path.stat().st_mtime_ns
+    except OSError:
+        # No stat (e.g. a pipe, or a race): read uncached rather than fail.
+        return _scan_head_impl(image_path, size)
+    return _scan_head_cached(str(image_path), size, mtime)
+
+
+@functools.lru_cache(maxsize=8)
+def _scan_head_cached(path_str: str, size: int, _mtime_ns: int) -> bytes:
+    """Cache shim: ``_mtime_ns`` is part of the key only (invalidates on change)."""
+    from pathlib import Path as _Path
+
+    return _scan_head_impl(_Path(path_str), size)
+
+
+def _scan_head_impl(image_path: Path, size: int) -> bytes:
     with open(image_path, "rb") as f:
         head = f.read(size)
     # Lazy import: isobmff imports this module's constants at top level.
@@ -280,7 +311,7 @@ def has_ai_metadata(image_path: Path) -> bool:
 
     # Binary scan covers C2PA (PNG caBX, JPEG APP11, AVIF/HEIF/JXL uuid boxes)
     # and IPTC AI markers in XMP. First 512KB (plus late ISOBMFF provenance boxes).
-    data = scan_head(image_path, 512 * 1024)
+    data = scan_head(image_path, _QUICK_SCAN_BYTES)
     if c2pa_marker_in(data):
         return True
     if any(marker in data for marker in AIGC_MARKERS):
@@ -312,13 +343,16 @@ def aigc_label(image_path: Path) -> dict[str, str] | None:
       found by a container-agnostic raw-byte scan (PNG/JPEG/WebP alike); and
     - a raw-JSON ``{"AIGC":{...}}`` block with no namespace, as embedded in JPEG
       EXIF (UserComment) by some China-served generators, brace-matched from the
-      scan head.
+      scan head; and
+    - a bare ``AIGC{...}`` blob (the label glued straight to its JSON, no
+      ``"AIGC":`` key wrapper) embedded in a JPEG APP segment near the JFIF
+      header by some China-served generators.
 
     Returns the decoded JSON (e.g. ``{"Label": "1", "ContentProducer": ...}``)
-    or None. The generic forms (the PNG-chunk key ``AIGC`` and the bare
-    ``{"AIGC":...}`` object) are accepted only if they carry at least one known
-    TC260 field (``_TC260_FIELDS``); the namespaced XMP element is unambiguous,
-    so any JSON object is accepted.
+    or None. The generic forms (the PNG-chunk key ``AIGC``, the bare
+    ``{"AIGC":...}`` object, and the bare ``AIGC{...}`` blob) are accepted only
+    if they carry at least one known TC260 field (``_TC260_FIELDS``); the
+    namespaced XMP element is unambiguous, so any JSON object is accepted.
     """
     import html
     import json
@@ -362,22 +396,74 @@ def aigc_label(image_path: Path) -> dict[str, str] | None:
         body = match.group(1) if match.group(1) is not None else match.group(2)
         return _parse(html.unescape(body.decode("utf-8", "replace")), require_tc260_field=False)
 
-    # Raw-JSON {"AIGC":{...}} block (no namespace), as written into JPEG EXIF
-    # (UserComment) by some China-served generators -- the PNG-chunk and XMP
-    # paths above both miss it. The bytes pre-check keeps the common (no-AIGC)
-    # path off the full-buffer decode; raw_decode then brace-matches the inner
-    # object (respecting nested braces / quoted strings) and `_parse` applies the
-    # same dict coercion + TC260-field gate as the generic PNG-chunk path.
-    if b'"AIGC"' in data:
-        text = data.decode("latin-1")
-        brace = text.find("{", text.find('"AIGC"') + len('"AIGC"'))
-        if brace != -1:
-            try:
-                _, end = json.JSONDecoder().raw_decode(text, brace)
-            except ValueError:
-                return None
-            return _parse(text[brace:end], require_tc260_field=True)
+    # Generic raw-JSON forms the PNG-chunk and XMP paths above both miss, each
+    # gated on a TC260 field: the ``"AIGC":{...}`` key wrapper (as written into
+    # JPEG EXIF UserComment) and the bare ``AIGC{...}`` blob (the label glued
+    # straight to its JSON, no key wrapper, in a JPEG APP segment near the JFIF
+    # header). `raw_decode` brace-matches the inner object (respecting nested
+    # braces / quoted strings); `_parse` applies the same dict coercion + TC260
+    # gate as the PNG-chunk path. A non-matching hit (no TC260 field, or an
+    # undecodable brace) must FALL THROUGH to the next form, never short-circuit:
+    # a quoted ``"AIGC"`` can appear later in an XMP packet while the real label
+    # is a bare ``AIGC{...}`` blob earlier in the file, so an unconditional return
+    # on the quoted form would shadow the bare form.
+    text = data.decode("latin-1")
+    for needle in ('"AIGC"', "AIGC{"):
+        start = text.find(needle)
+        if start == -1:
+            continue
+        # First brace at/after the needle: the object brace for ``"AIGC":{`` and
+        # the glued brace (at start+4) for the bare ``AIGC{`` -- one search covers both.
+        brace = text.find("{", start)
+        if brace == -1:
+            continue
+        try:
+            _, end = json.JSONDecoder().raw_decode(text, brace)
+        except ValueError:
+            continue
+        if result := _parse(text[brace:end], require_tc260_field=True):
+            return result
     return None
+
+
+# C2PA "Durable Content Credentials" manifest repositories (C2PA 2.4). When the
+# embedded manifest is stripped, an XMP ``dcterms:provenance`` URL can still point
+# at the vendor's cloud manifest store, from which the credentials are recoverable
+# server-side via the file's soft binding. Host -> vendor label. Verified on real
+# files: Adobe's Content Authenticity cloud store.
+_C2PA_MANIFEST_REPOSITORIES: tuple[tuple[bytes, str], ...] = (
+    (b"cai-manifests.adobe.com", "Adobe Content Authenticity"),
+)
+
+
+def c2pa_cloud_manifest_in(data: bytes) -> str | None:
+    """Return a C2PA cloud-manifest vendor label if ``data`` carries an XMP
+    ``dcterms:provenance`` pointer to a known manifest repository, else None.
+
+    The shared byte-scan (mirroring ``soft_binding_vendors_in``), so a caller that
+    already holds the scan head (``identify``) reuses it instead of re-reading.
+    """
+    if b"dcterms:provenance" not in data:
+        return None
+    for host, vendor in _C2PA_MANIFEST_REPOSITORIES:
+        if host in data:
+            return vendor
+    return None
+
+
+def c2pa_cloud_manifest(image_path: Path) -> str | None:
+    """Return a C2PA cloud-manifest vendor label if the file carries only an XMP
+    ``dcterms:provenance`` pointer to a manifest repository (C2PA 2.4 Durable
+    Content Credentials), else None.
+
+    This fires on the laundering case where the *embedded* manifest was stripped
+    but the XMP cloud reference survives, so the Content Credentials remain
+    recoverable server-side. It is provenance, NOT an AI assertion: the cloud
+    manifest can describe a human edit as easily as an AI generation, and reading
+    its contents needs a network fetch we do not do. ``identify`` surfaces it as a
+    provenance signal without setting ``is_ai_generated``.
+    """
+    return c2pa_cloud_manifest_in(scan_head(image_path, _QUICK_SCAN_BYTES))
 
 
 def huggingface_job(image_path: Path) -> str | None:
@@ -427,7 +513,7 @@ def samsung_genai(image_path: Path) -> int | None:
     gated on the ``PhotoEditor_Re_Edit_Data`` container so an incidental
     ``genAIType`` token cannot false-positive.
     """
-    head = scan_head(image_path, 512 * 1024)
+    head = scan_head(image_path, _QUICK_SCAN_BYTES)
     if _SAMSUNG_EDITOR_MARKER not in head:
         return None
     m = _SAMSUNG_GENAI_RE.search(head)

@@ -52,7 +52,16 @@ def run_img2img(
         )
         done_ev.set()
         return result.images[0]
-    except TypeError:
+    except TypeError as exc:
+        # The only TypeError we retry is the deprecated-callback case: `_call_pipeline`
+        # passes the legacy `callback`/`callback_steps` kwargs, and a diffusers version
+        # that removed them raises TypeError("... unexpected keyword argument
+        # 'callback'"). We then re-run once WITHOUT the progress callback. Any OTHER
+        # TypeError (e.g. a bad control_image/dtype in the forward pass) is a real error
+        # -- re-raise it instead of silently re-running the whole diffusion pass and
+        # masking the cause.
+        if "callback" not in str(exc):
+            raise
         first_step.set()
         result = _call_pipeline(
             pipeline, image, strength, num_inference_steps, guidance_scale, generator, None, extra_kwargs

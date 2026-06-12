@@ -1,13 +1,17 @@
 """Watermark removal using diffusion model regeneration attack.
 
 Two pipelines:
-1. ``default`` -- plain SDXL img2img. Partial-noise regeneration scrubs the
-   invisible watermark; ``strength`` controls how much is regenerated.
-2. ``controlnet`` -- SDXL img2img with a canny ControlNet. The watermark REMOVAL
-   still comes from the img2img regeneration (``strength``); the ControlNet only
-   PRESERVES structure (text/faces) by conditioning on the edge map. No original
-   pixels are ever copied or frozen, so SynthID does not survive.
+1. ``controlnet`` (DEFAULT) -- SDXL img2img with a canny ControlNet. The watermark
+   REMOVAL still comes from the img2img regeneration (``strength``); the ControlNet
+   only PRESERVES structure (text/faces) by conditioning on the edge map. No original
+   pixels are ever copied or frozen. Because the edge map keeps the regeneration
+   closer to the original, it needs a higher ``strength`` floor than ``default`` to
+   destroy SynthID (the certified controlnet ladder; see ``watermark_profiles``).
    ``controlnet_conditioning_scale`` is the preservation knob.
+2. ``default`` -- plain SDXL img2img. Partial-noise regeneration scrubs the
+   invisible watermark; ``strength`` controls how much is regenerated. Lighter (no
+   ControlNet weights), but at the low default strength it leaves SynthID on
+   flat-graphic content -- use it for inputs without text/faces.
 """
 
 # torch/diffusers/cv2 boundary: these libs ship no usable types for the tensor and
@@ -32,6 +36,7 @@ from remove_ai_watermarks.noai.watermark_profiles import (
     CONTROLNET_CANNY_MODEL,
     DEFAULT_MODEL_ID,
     DEFAULT_STRENGTH,
+    normalize_profile,
     resolve_strength,
 )
 
@@ -323,13 +328,14 @@ class WatermarkRemover:
         torch_dtype: Any = None,
         progress_callback: Callable[[str], None] | None = None,
         hf_token: str | None = None,
-        pipeline: str = "default",
+        pipeline: str = "controlnet",
         controlnet_conditioning_scale: float = 1.0,
     ) -> None:
         self.model_id = model_id or self.DEFAULT_MODEL_ID
         # The pipeline profile is threaded explicitly (not inferred from model_id):
-        # both "default" and "controlnet" use the same SDXL base checkpoint.
-        self.model_profile = pipeline
+        # both "sdxl" and "controlnet" use the same SDXL base checkpoint. Normalize so
+        # the legacy "default" alias resolves to "sdxl".
+        self.model_profile = normalize_profile(pipeline)
         self.controlnet_conditioning_scale = controlnet_conditioning_scale
 
         if not is_watermark_removal_available():

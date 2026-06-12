@@ -790,6 +790,42 @@ class TestAIGCLabel:
     def test_has_ai_metadata_detects_raw_json_exif_form(self, tmp_path: Path):
         assert has_ai_metadata(self._aigc_exif_jpeg(tmp_path))
 
+    def _aigc_bare_jpeg(self, tmp_path: Path, producer: str = "00119144030008867405X210002") -> Path:
+        """Some China-served generators glue the TC260 label straight to its JSON
+        as a bare ``AIGC{...}`` blob inside a JPEG APP segment (no ``"AIGC":``
+        key wrapper, no PNG chunk, no namespaced XMP) -- seen near the JFIF
+        header on real 2026-06 downloads."""
+        p = tmp_path / "aigc_bare.jpg"
+        Image.new("RGB", (32, 32)).save(p)
+        raw = p.read_bytes()
+        blob = b'AIGC{"Label":"1","ContentProducer":"' + producer.encode() + b'","ProduceID":"8F995586"}'
+        segment = b"\xff\xe9" + (len(blob) + 2).to_bytes(2, "big") + blob  # APP9
+        p.write_bytes(raw[:2] + segment + raw[2:])  # splice after SOI
+        return p
+
+    def test_parses_bare_aigc_jpeg_segment_form(self, tmp_path: Path):
+        from remove_ai_watermarks.metadata import aigc_label
+
+        info = aigc_label(self._aigc_bare_jpeg(tmp_path))
+        assert info is not None
+        assert info["Label"] == "1"
+        assert info["ContentProducer"] == "00119144030008867405X210002"
+
+    def test_has_ai_metadata_detects_bare_aigc_jpeg_form(self, tmp_path: Path):
+        assert has_ai_metadata(self._aigc_bare_jpeg(tmp_path))
+
+    def test_bare_aigc_without_tc260_field_ignored(self, tmp_path: Path):
+        """A bare ``AIGC{...}`` blob with no TC260 field must not false-positive."""
+        from remove_ai_watermarks.metadata import aigc_label
+
+        p = tmp_path / "bare_unrelated.jpg"
+        Image.new("RGB", (32, 32)).save(p)
+        raw = p.read_bytes()
+        blob = b'AIGC{"unrelated":"value"}'
+        segment = b"\xff\xe9" + (len(blob) + 2).to_bytes(2, "big") + blob
+        p.write_bytes(raw[:2] + segment + raw[2:])
+        assert aigc_label(p) is None
+
     def test_raw_json_without_tc260_field_ignored(self, tmp_path: Path):
         """A bare ``{"AIGC":{...}}`` object with no TC260 field must not fire."""
         import json
@@ -1185,3 +1221,49 @@ class TestFfmpegMetadataStrip:
         remove_ai_metadata(src, out)
         assert out.exists()
         assert b"Suno AI generated" not in out.read_bytes()  # tag stripped, audio kept
+
+
+class TestC2paCloudManifest:
+    """C2PA 2.4 Durable Content Credentials: an XMP dcterms:provenance pointer to
+    a vendor cloud manifest store survives when the embedded manifest is stripped."""
+
+    def _cloud_png(self, tmp_path: Path, host: bytes = b"cai-manifests.adobe.com") -> Path:
+        xmp = (
+            b'<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/">'
+            b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+            b'<rdf:Description rdf:about="" xmlns:dcterms="http://purl.org/dc/terms/" '
+            b'dcterms:provenance="https://' + host + b'/manifests/urn-c2pa-abc123"> </rdf:Description>'
+            b'</rdf:RDF></x:xmpmeta><?xpacket end="w"?>'
+        )
+        p = tmp_path / "cloud.png"
+        img = Image.new("RGB", (16, 16))
+        meta = PngInfo()
+        meta.add_itxt("XML:com.adobe.xmp", xmp.decode("latin-1"))
+        img.save(p, pnginfo=meta)
+        return p
+
+    def test_detects_adobe_cloud_manifest(self, tmp_path: Path):
+        from remove_ai_watermarks.metadata import c2pa_cloud_manifest
+
+        assert c2pa_cloud_manifest(self._cloud_png(tmp_path)) == "Adobe Content Authenticity"
+
+    def test_no_provenance_pointer_is_none(self, tmp_clean_png: Path):
+        from remove_ai_watermarks.metadata import c2pa_cloud_manifest
+
+        assert c2pa_cloud_manifest(tmp_clean_png) is None
+
+    def test_unknown_host_is_none(self, tmp_path: Path):
+        from remove_ai_watermarks.metadata import c2pa_cloud_manifest
+
+        # A dcterms:provenance pointer to an unrecognized host is not attributed.
+        assert c2pa_cloud_manifest(self._cloud_png(tmp_path, host=b"manifests.example.com")) is None
+
+    def test_cloud_manifest_does_not_assert_ai(self, tmp_path: Path):
+        # Provenance only -- a cloud manifest can describe a human edit, so the
+        # verdict must stay 'unknown', not 'AI-generated'.
+        from remove_ai_watermarks.identify import identify
+
+        r = identify(self._cloud_png(tmp_path), check_visible=False, check_invisible=False)
+        assert r.is_ai_generated is None
+        assert any("Durable Content Credentials" in w for w in r.watermarks)
+        assert any(s.name == "c2pa_cloud" for s in r.signals)
