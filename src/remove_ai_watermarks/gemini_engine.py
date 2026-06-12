@@ -238,11 +238,27 @@ class GeminiEngine:
         self._alpha_small = _calculate_alpha_map(bg_small)
         self._alpha_large = _calculate_alpha_map(bg_large)
 
+        # Track which corner the last detection found.
+        self._last_detected_corner: str = "bottom-right"
+
         logger.debug(
             "Alpha maps loaded: small=%s, large=%s",
             self._alpha_small.shape,
             self._alpha_large.shape,
         )
+
+    def _infer_corner_from_region(self, image: NDArray[Any], region: tuple[int, int, int, int]) -> None:
+        """Set _last_detected_corner based on which corner the region is closest to."""
+        h, w = image.shape[:2]
+        rx, ry, rw, rh = region
+        cx = rx + rw / 2.0
+        cy = ry + rh / 2.0
+        in_right = cx > w / 2.0
+        in_bottom = cy > h / 2.0
+        if in_bottom:
+            self._last_detected_corner = "bottom-right" if in_right else "bottom-left"
+        else:
+            self._last_detected_corner = "top-right" if in_right else "top-left"
 
     def get_alpha_map(self, size: WatermarkSize) -> NDArray[Any]:
         """Get the base alpha map for a specific standard size."""
@@ -284,24 +300,69 @@ class GeminiEngine:
         image: NDArray[Any],
         force_size: WatermarkSize | None = None,
     ) -> DetectionResult:
-        """Detect Gemini watermark using multi-scale Snap Engine logic (ported from C++ vendor algorithm)."""
-        result = DetectionResult()
+        """Detect Gemini watermark using multi-scale Snap Engine logic.
 
+        Scans all four corners and returns the best detection."""
+        all_dets = self.detect_all_watermarks(image, force_size)
+        if not all_dets:
+            return DetectionResult()
+        return max(all_dets, key=lambda d: d.confidence)
+
+    def detect_all_watermarks(
+        self,
+        image: NDArray[Any],
+        force_size: WatermarkSize | None = None,
+    ) -> list[DetectionResult]:
+        """Detect Gemini watermarks in ALL corners that exceed the detection threshold.
+
+        Returns a list of detections (one per corner that fired), ordered by confidence
+        descending. Used for removing multiple watermarks from different corners.
+        """
+        dets: list[DetectionResult] = []
         if image is None or image.size == 0:
-            return result
+            return dets
+        for corner in ("bottom-right", "bottom-left", "top-right", "top-left"):
+            result = self._detect_corner(image, force_size, corner)
+            if result.detected:
+                dets.append(result)
+        dets.sort(key=lambda d: d.confidence, reverse=True)
+        return dets
+
+    def _detect_corner(
+        self,
+        image: NDArray[Any],
+        force_size: WatermarkSize | None,
+        corner: str,
+    ) -> DetectionResult:
+        """Detect Gemini watermark in a specific corner."""
+        result = DetectionResult()
 
         h, w = image.shape[:2]
         base_size = force_size or get_watermark_size(w, h)
         result.size = base_size
 
-        # Dynamically search bottom-right corner. 512 covers up to 512px from the
-        # corner -- enough for known Gemini margin variations (standard: 64+96=160px;
-        # observed variants up to ~300px). 256 was too tight and caused misses.
+        # Search region: a square anchored at the given corner.
         search_size = int(min(min(w, h), 512))
-        sx1 = max(0, w - search_size)
-        sy1 = max(0, h - search_size)
+        if corner == "bottom-right":
+            sx1 = max(0, w - search_size)
+            sy1 = max(0, h - search_size)
+        elif corner == "bottom-left":
+            sx1 = 0
+            sy1 = max(0, h - search_size)
+        elif corner == "top-right":
+            sx1 = max(0, w - search_size)
+            sy1 = 0
+        elif corner == "top-left":
+            sx1 = 0
+            sy1 = 0
+        else:
+            sx1 = max(0, w - search_size)
+            sy1 = max(0, h - search_size)
 
-        search_region = image[sy1:h, sx1:w]
+        sx2 = min(w, sx1 + search_size)
+        sy2 = min(h, sy1 + search_size)
+
+        search_region = image[sy1:sy2, sx1:sx2]
         if len(search_region.shape) == 3 and search_region.shape[2] >= 3:
             gray_sr = cv2.cvtColor(search_region, cv2.COLOR_BGR2GRAY)
         else:
@@ -328,10 +389,10 @@ class GeminiEngine:
         pos_x = sx1 + best_loc[0]
         pos_y = sy1 + best_loc[1]
 
-        # Corner promotion: a near-perfect but small sparkle in the bottom-right
-        # corner is otherwise outranked by a larger, mediocre size-weighted match
+        # Corner promotion: a near-perfect but small sparkle in the target corner
+        # is otherwise outranked by a larger, mediocre size-weighted match
         # (see _CORNER_PROMOTE_NCC). Override the global pick with it when present.
-        promoted = self._corner_promote(image, best_raw_ncc)
+        promoted = self._corner_promote(image, best_raw_ncc, corner)
         if promoted is not None:
             best_scale, pos_x, pos_y, best_raw_ncc = promoted
 
@@ -378,17 +439,26 @@ class GeminiEngine:
 
         # ── Stage 3: Variance Analysis ───────────────────────────────
         var_score = 0.0
-        ref_h = min(y1, best_scale)
-
-        if ref_h > 8:
-            ref_region = image[y1 - ref_h : y1, x1:x2]
-            gray_ref = cv2.cvtColor(ref_region, cv2.COLOR_BGR2GRAY) if len(ref_region.shape) == 3 else ref_region
-
-            _, s_wm = cv2.meanStdDev(gray_region)
-            _, s_ref = cv2.meanStdDev(gray_ref)
-
-            if s_ref[0][0] > 5.0:
-                var_score = max(0.0, min(1.0, 1.0 - (s_wm[0][0] / s_ref[0][0])))
+        # Reference region: adjacent area outside the watermark box, direction
+        # depends on which corner we're checking.
+        if corner in ("bottom-right", "bottom-left"):
+            ref_h = min(y1, best_scale)
+            if ref_h > 8:
+                ref_region = image[y1 - ref_h : y1, x1:x2]
+                gray_ref = cv2.cvtColor(ref_region, cv2.COLOR_BGR2GRAY) if len(ref_region.shape) == 3 else ref_region
+                _, s_wm = cv2.meanStdDev(gray_region)
+                _, s_ref = cv2.meanStdDev(gray_ref)
+                if s_ref[0][0] > 5.0:
+                    var_score = max(0.0, min(1.0, 1.0 - (s_wm[0][0] / s_ref[0][0])))
+        elif corner in ("top-right", "top-left"):
+            ref_h = min(h - (y1 + best_scale), best_scale)
+            if ref_h > 8:
+                ref_region = image[y1 + best_scale : y1 + best_scale + ref_h, x1:x2]
+                gray_ref = cv2.cvtColor(ref_region, cv2.COLOR_BGR2GRAY) if len(ref_region.shape) == 3 else ref_region
+                _, s_wm = cv2.meanStdDev(gray_region)
+                _, s_ref = cv2.meanStdDev(gray_ref)
+                if s_ref[0][0] > 5.0:
+                    var_score = max(0.0, min(1.0, 1.0 - (s_wm[0][0] / s_ref[0][0])))
 
         result.variance_score = float(var_score)
 
@@ -426,8 +496,9 @@ class GeminiEngine:
         self,
         image: NDArray[Any],
         current_raw_ncc: float,
+        corner_name: str = "bottom-right",
     ) -> tuple[int, int, int, float] | None:
-        """Search the bottom-right corner for a very-high-fidelity sparkle match.
+        """Search the specified corner for a very-high-fidelity sparkle match.
 
         Returns ``(scale, x, y, raw_ncc)`` when the corner holds a match with raw
         NCC >= ``_CORNER_PROMOTE_NCC`` that beats the global pick's ``current_raw_ncc``,
@@ -440,9 +511,18 @@ class GeminiEngine:
             self._CORNER_PROMOTE_MIN, min(self._CORNER_PROMOTE_MAX, round(min(w, h) * self._CORNER_PROMOTE_FRAC))
         )
         cs = int(min(min(w, h), side))
-        cx1, cy1 = max(0, w - cs), max(0, h - cs)
-        corner = image[cy1:h, cx1:w]
-        gray = cv2.cvtColor(corner, cv2.COLOR_BGR2GRAY) if corner.ndim == 3 and corner.shape[2] >= 3 else corner
+        if corner_name == "bottom-right":
+            cx1, cy1 = max(0, w - cs), max(0, h - cs)
+        elif corner_name == "bottom-left":
+            cx1, cy1 = 0, max(0, h - cs)
+        elif corner_name == "top-right":
+            cx1, cy1 = max(0, w - cs), 0
+        elif corner_name == "top-left":
+            cx1, cy1 = 0, 0
+        else:
+            cx1, cy1 = max(0, w - cs), max(0, h - cs)
+        corner_img = image[cy1 : min(h, cy1 + cs), cx1 : min(w, cx1 + cs)]
+        gray = cv2.cvtColor(corner_img, cv2.COLOR_BGR2GRAY) if corner_img.ndim == 3 and corner_img.shape[2] >= 3 else corner_img
         gray = gray.astype(np.float32) / 255.0
 
         best_raw = -1.0

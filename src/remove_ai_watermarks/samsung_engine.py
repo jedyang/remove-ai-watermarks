@@ -203,21 +203,63 @@ class SamsungEngine:
         self.height_frac = height_frac
         self.margin_left_frac = margin_left_frac
         self.margin_bottom_frac = margin_bottom_frac
+        # Track which corner the last detection found, so removal targets the same corner.
+        self._last_detected_corner: str = "bottom-left"
 
     # ── Locate ────────────────────────────────────────────────────────
 
     def locate(self, image: NDArray[Any]) -> SamsungLocation:
         """Anchor the watermark box in the bottom-left corner by geometry."""
         h, w = image.shape[:2]
+        return self._locate_corner(image, "bottom-left")
+
+    def _locate_corner(self, image: NDArray[Any], corner: str) -> SamsungLocation:
+        """Anchor the watermark box in the given corner by geometry.
+
+        Args:
+            corner: One of 'bottom-right', 'bottom-left', 'top-right', 'top-left'.
+        """
+        h, w = image.shape[:2]
         wm_w = max(40, int(w * self.width_frac))
         wm_h = max(16, int(w * self.height_frac))
-        margin_l = max(2, int(w * self.margin_left_frac))
-        margin_b = max(2, int(w * self.margin_bottom_frac))
-        x = min(margin_l, max(0, w - wm_w))
-        y = max(0, h - margin_b - wm_h)
+        margin_x = max(2, int(w * self.margin_left_frac))
+        margin_y = max(2, int(w * self.margin_bottom_frac))
+
+        if corner == "bottom-right":
+            x = max(0, w - margin_x - wm_w)
+            y = max(0, h - margin_y - wm_h)
+        elif corner == "bottom-left":
+            x = min(margin_x, max(0, w - wm_w))
+            y = max(0, h - margin_y - wm_h)
+        elif corner == "top-right":
+            x = max(0, w - margin_x - wm_w)
+            y = min(margin_y, max(0, h - wm_h))
+        elif corner == "top-left":
+            x = min(margin_x, max(0, w - wm_w))
+            y = min(margin_y, max(0, h - wm_h))
+        else:
+            raise ValueError(f"Unknown corner: {corner}")
+
         wm_w = min(wm_w, w - x)
         wm_h = min(wm_h, h - y)
         return SamsungLocation(x=x, y=y, w=wm_w, h=wm_h, is_fallback=True)
+
+    def _all_corners(self) -> list[str]:
+        """Return the four corners to scan, in priority order."""
+        return ["bottom-right", "bottom-left", "top-right", "top-left"]
+
+    def _infer_corner_from_region(self, image: NDArray[Any], region: tuple[int, int, int, int]) -> None:
+        """Set _last_detected_corner based on which corner the region is closest to."""
+        h, w = image.shape[:2]
+        rx, ry, rw, rh = region
+        cx = rx + rw / 2.0
+        cy = ry + rh / 2.0
+        in_right = cx > w / 2.0
+        in_bottom = cy > h / 2.0
+        if in_bottom:
+            self._last_detected_corner = "bottom-right" if in_right else "bottom-left"
+        else:
+            self._last_detected_corner = "top-right" if in_right else "top-left"
 
     # ── Mask ──────────────────────────────────────────────────────────
 
@@ -266,23 +308,42 @@ class SamsungEngine:
 
     def detect(self, image: NDArray[Any]) -> SamsungDetection:
         """Detect the visible Samsung mark by matching the alpha-template glyph
-        silhouette against the corner candidate (TM_CCOEFF_NORMED)."""
-        det = SamsungDetection()
+        silhouette against the corner candidate (TM_CCOEFF_NORMED).
+
+        Scans all four corners and returns the best match."""
+        all_dets = self.detect_all(image)
+        if not all_dets:
+            return SamsungDetection()
+        return max(all_dets, key=lambda d: d.confidence)
+
+    def detect_all(self, image: NDArray[Any]) -> list[SamsungDetection]:
+        """Detect visible Samsung marks in ALL corners that exceed the NCC threshold.
+
+        Returns a list of detections (one per corner that fired), ordered by confidence
+        descending. Used for removing multiple watermarks from different corners.
+        """
+        dets: list[SamsungDetection] = []
         if image is None or image.size == 0:
-            return det
-        loc = self.locate(image)
-        mask = self.extract_mask(image, loc)
-        x, y, bw, bh = loc.bbox
-        box = mask[y : y + bh, x : x + bw]
-        coverage = float((box > 0).sum()) / float(max(1, bw * bh))
-        det.region = loc.bbox
-        det.coverage = coverage
-        if coverage >= DETECT_MIN_COVERAGE:
-            score = _template_match_score(box, image.shape[1])
-            det.confidence = score
-            det.detected = score >= DETECT_NCC_THRESHOLD
-            logger.debug("Samsung detect: coverage=%.3f ncc=%.2f detected=%s", coverage, score, det.detected)
-        return det
+            return dets
+        for corner in self._all_corners():
+            loc = self._locate_corner(image, corner)
+            mask = self.extract_mask(image, loc)
+            x, y, bw, bh = loc.bbox
+            box = mask[y : y + bh, x : x + bw]
+            coverage = float((box > 0).sum()) / float(max(1, bw * bh))
+            if coverage >= DETECT_MIN_COVERAGE:
+                score = _template_match_score(box, image.shape[1])
+                logger.debug("Samsung detect %s: coverage=%.3f ncc=%.2f", corner, coverage, score)
+                if score >= DETECT_NCC_THRESHOLD:
+                    det = SamsungDetection(
+                        detected=True,
+                        confidence=score,
+                        region=loc.bbox,
+                        coverage=coverage,
+                    )
+                    dets.append(det)
+        dets.sort(key=lambda d: d.confidence, reverse=True)
+        return dets
 
     # ── Reverse-alpha (recovery + residual inpaint) ───────────────────
 
@@ -292,15 +353,32 @@ class SamsungEngine:
         return image is not None and image.size > 0 and _alpha_template() is not None
 
     def _fixed_alpha_map(self, image: NDArray[Any]) -> tuple[NDArray[Any], tuple[int, int, int, int]] | None:
-        """Place the template by fixed width-relative geometry (bottom-left)."""
+        """Place the template by fixed width-relative geometry.
+        Placement respects the corner detected by detect()."""
         at = _alpha_template()
         if at is None:
             return None
         h, w = image.shape[:2]
         gw = min(w, max(1, int(_ALPHA_WIDTH_FRAC * w)))
         gh = min(h, max(1, int(_ALPHA_HEIGHT_FRAC * w)))
-        ax = min(max(0, int(_ALPHA_MARGIN_LEFT_FRAC * w)), max(0, w - gw))
-        ay = max(0, h - int(_ALPHA_MARGIN_BOTTOM_FRAC * w) - gh)
+        corner = self._last_detected_corner
+        margin_x = int(_ALPHA_MARGIN_LEFT_FRAC * w)
+        margin_y = int(_ALPHA_MARGIN_BOTTOM_FRAC * w)
+        if corner == "bottom-right":
+            ax = max(0, w - margin_x - gw)
+            ay = max(0, h - margin_y - gh)
+        elif corner == "bottom-left":
+            ax = min(margin_x, max(0, w - gw))
+            ay = max(0, h - margin_y - gh)
+        elif corner == "top-right":
+            ax = max(0, w - margin_x - gw)
+            ay = min(margin_y, max(0, h - gh))
+        elif corner == "top-left":
+            ax = min(margin_x, max(0, w - gw))
+            ay = min(margin_y, max(0, h - gh))
+        else:
+            ax = min(margin_x, max(0, w - gw))
+            ay = max(0, h - margin_y - gh)
         amap = np.zeros((h, w), np.float32)
         amap[ay : ay + gh, ax : ax + gw] = cv2.resize(at, (gw, gh), interpolation=cv2.INTER_LINEAR)
         return amap, (ax, ay, gw, gh)
@@ -314,7 +392,7 @@ class SamsungEngine:
         if at is None or sil is None:
             return None
         h, w = image.shape[:2]
-        loc = self.locate(image)
+        loc = self._locate_corner(image, self._last_detected_corner)
         bx, by, bw, bh = loc.bbox
         box_mask = self.extract_mask(image, loc)[by : by + bh, bx : bx + bw]
         expected = _ALPHA_WIDTH_FRAC * w
